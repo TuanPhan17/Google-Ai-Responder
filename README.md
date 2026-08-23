@@ -4,8 +4,11 @@ Receives Google Business Profile reviews, generates a personalized reply, and
 either publishes it or routes it to a human — with the publish/hold decision
 made by deterministic application code, never by the model.
 
-**Status: Phase 1 complete.** Foundation, Google OAuth, account/location/review
-retrieval, mock fixtures. No AI generation and no writes to Google yet.
+**Status: Phase 2 complete.** Foundation, Google OAuth, account/location/review
+retrieval, mock fixtures, and a reusable OpenAI review-response service with
+structured-output validation. Not yet wired into the ingest pipeline (Phase 3
+adds the deterministic publishing policy that gates it), and no writes to
+Google yet.
 
 ---
 
@@ -31,6 +34,7 @@ route to a human, regardless of what the model says.
 | `src/auth` | OAuth flow, token encryption, access-token refresh, admin session |
 | `src/google` | The single authorized HTTP path + accounts/locations/reviews |
 | `src/reviews` | Mapper, idempotent ingest, sync orchestration, source seam |
+| `src/openai` | The single authorized HTTP path to OpenAI + review-response service + prompt |
 | `src/database` | Supabase client and repositories |
 | `src/schemas` | Zod schemas for every external response |
 | `src/mocks` | 14 fixtures in Google's wire format |
@@ -137,6 +141,29 @@ per account.
 
 ---
 
+## OpenAI setup
+
+1. [platform.openai.com](https://platform.openai.com) → API keys → create a key.
+   Paste it into `OPENAI_API_KEY`.
+2. That's it to run the service directly — `OPENAI_MODEL` defaults to
+   `gpt-4o-mini`, and `OPENAI_API_TIMEOUT_MS`/`OPENAI_API_MAX_ATTEMPTS` have
+   working defaults.
+
+This key is **not gated by `MOCK_MODE`** — mock mode only stands in for the
+Google Business Profile source. Everything else (fixtures, ingest, the
+dashboard once it exists) works with no OpenAI key set; you only need one to
+actually call `generateReviewResponse` (directly, or from a script/test you
+write against it — Phase 3 wires it into the ingest pipeline).
+
+The service uses the [Responses API](https://platform.openai.com/docs/api-reference/responses)
+with Structured Outputs (`strict: true`) constraining the model to the exact
+shape in `src/schemas/openai.ts`. That JSON Schema is hand-kept in sync with
+the Zod schema next to it, which still runs on top — strict mode guarantees
+shape, not that `sentiment` is one we actually asked for versus, say, a model
+that ignores the constraint entirely on some future API change.
+
+---
+
 ## Environment variables
 
 See `.env.example` for the annotated list. The ones that bite:
@@ -147,6 +174,7 @@ See `.env.example` for the annotated list. The ones that bite:
 | `TOKEN_ENCRYPTION_KEY` | 32 bytes base64. **Rotating it makes stored refresh tokens unreadable** — you must reconnect Google. |
 | `SUPABASE_SERVICE_ROLE_KEY` | Bypasses RLS. Server-side only. |
 | `GOOGLE_OAUTH_REDIRECT_URI` | Must byte-match Cloud Console. |
+| `OPENAI_API_KEY` | Not gated by `MOCK_MODE`. Only needed to actually generate a response. |
 
 ---
 
@@ -163,6 +191,15 @@ detection, retry classification, and log redaction.
 
 The retry tests assert that 400 and 403 are **not** retried — an invalid request
 stays invalid, and missing API access will not fix itself by trying harder.
+
+Phase 2 covers the review-response structured-output schema (accepts the
+documented shape, rejects bad enums/ratings/missing fields), prompt
+construction (star-only reviews are flagged as having no text rather than
+described, business context is only included when supplied, never fabricated),
+and the OpenAI client (bearer auth, retries a 429 but not a 400, retries a
+schema-validation failure up to the attempt limit, and does not retry a
+model refusal). All of it runs against a mocked `fetch` — no `OPENAI_API_KEY`
+or network access is required to run the test suite.
 
 ---
 

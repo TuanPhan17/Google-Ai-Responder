@@ -58,10 +58,41 @@ export class GoogleAuthError extends AppError {
   }
 }
 
-/** A Google response did not match the schema we expect. */
+/** A Google or OpenAI response did not match the schema we expect. */
 export class SchemaValidationError extends AppError {
   constructor(message: string, context?: Record<string, unknown>, cause?: unknown) {
     super(message, { code: "SCHEMA_VALIDATION_ERROR", retryable: false, context, cause });
+  }
+}
+
+/** A request to the OpenAI API failed. */
+export class OpenAiApiError extends AppError {
+  readonly status: number;
+
+  constructor(
+    message: string,
+    options: { status: number; context?: Record<string, unknown>; cause?: unknown },
+  ) {
+    super(message, {
+      code: "OPENAI_API_ERROR",
+      // Same shape as GoogleApiError: 408/429 and 5xx are worth a retry, a 4xx
+      // otherwise means the request itself is wrong and retrying won't fix it.
+      retryable: options.status === 408 || options.status === 429 || options.status >= 500,
+      context: { ...options.context, status: options.status },
+      cause: options.cause,
+    });
+    this.status = options.status;
+  }
+}
+
+/**
+ * The model declined to produce structured output (a Structured Outputs
+ * `refusal`, not a malformed one). Not retryable: re-sending the same review
+ * is likely to be refused again, and retrying blindly would just burn quota.
+ */
+export class OpenAiRefusalError extends AppError {
+  constructor(message: string, context?: Record<string, unknown>) {
+    super(message, { code: "OPENAI_REFUSAL", retryable: false, context });
   }
 }
 
@@ -103,5 +134,6 @@ export function toHttpStatus(error: unknown): number {
   if (error instanceof BadRequestError) return 400;
   if (error instanceof GoogleAuthError) return 409;
   if (error instanceof GoogleApiError) return error.status >= 500 ? 502 : error.status;
+  if (error instanceof OpenAiApiError) return error.status >= 500 ? 502 : error.status;
   return 500;
 }

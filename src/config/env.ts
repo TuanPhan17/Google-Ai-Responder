@@ -68,6 +68,17 @@ const baseSchema = z.object({
   GOOGLE_API_TIMEOUT_MS: z.coerce.number().int().positive().max(120_000).default(20_000),
   GOOGLE_API_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(8).default(4),
 
+  /**
+   * Optional here, not gated by MOCK_MODE: response generation is a separate
+   * concern from the Google Business Profile source, and this key isn't
+   * needed until something actually calls the AI service.
+   * getOpenAiApiKey() below is where a missing key becomes a loud failure.
+   */
+  OPENAI_API_KEY: emptyToUndefined(z.string().min(1).optional()),
+  OPENAI_MODEL: z.string().min(1).default("gpt-4o-mini"),
+  OPENAI_API_TIMEOUT_MS: z.coerce.number().int().positive().max(120_000).default(30_000),
+  OPENAI_API_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(8).default(4),
+
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
 });
 
@@ -144,4 +155,13 @@ export function getGoogleOAuthConfig(): {
     clientSecret: env.GOOGLE_CLIENT_SECRET,
     redirectUri: env.GOOGLE_OAUTH_REDIRECT_URI,
   };
+}
+
+/** OpenAI API key, narrowed to non-optional. Throws with setup instructions if unset. */
+export function getOpenAiApiKey(): string {
+  const key = getEnv().OPENAI_API_KEY;
+  if (!key) {
+    throw new Error("OPENAI_API_KEY is not set. Add it to .env.local to use the AI response service.");
+  }
+  return key;
 }
