@@ -4,11 +4,12 @@ Receives Google Business Profile reviews, generates a personalized reply, and
 either publishes it or routes it to a human — with the publish/hold decision
 made by deterministic application code, never by the model.
 
-**Status: Phase 2 complete.** Foundation, Google OAuth, account/location/review
-retrieval, mock fixtures, and a reusable OpenAI review-response service with
-structured-output validation. Not yet wired into the ingest pipeline (Phase 3
-adds the deterministic publishing policy that gates it), and no writes to
-Google yet.
+**Status: Phase 3 complete.** Foundation, Google OAuth, account/location/review
+retrieval, mock fixtures, a reusable AI review-response service with
+structured-output validation, and the deterministic risk classification +
+publishing-policy service that decides auto-publish vs. human approval. Not
+yet wired into the ingest pipeline end-to-end (Phase 4 adds persistence of the
+decision, Phase 5 the approval workflow), and no writes to Google yet.
 
 ---
 
@@ -35,6 +36,7 @@ route to a human, regardless of what the model says.
 | `src/google` | The single authorized HTTP path + accounts/locations/reviews |
 | `src/reviews` | Mapper, idempotent ingest, sync orchestration, source seam |
 | `src/openai` | The single authorized HTTP path to OpenAI + review-response service + prompt |
+| `src/policies` | Deterministic risk classification + the publishing-policy service |
 | `src/database` | Supabase client and repositories |
 | `src/schemas` | Zod schemas for every external response |
 | `src/mocks` | 14 fixtures in Google's wire format |
@@ -200,6 +202,17 @@ and the OpenAI client (bearer auth, retries a 429 but not a 400, retries a
 schema-validation failure up to the attempt limit, and does not retry a
 model refusal). All of it runs against a mocked `fetch` — no `OPENAI_API_KEY`
 or network access is required to run the test suite.
+
+Phase 3 covers the two non-negotiable safety invariants directly: a
+combinatorial test fuzzes every rating/risk/human-review/settings combination
+to prove a 1-, 2-, or 3-star review can never auto-publish and a medium/high
+risk review can never auto-publish even at 5 stars — including against a
+deliberately over-permissive settings object, to prove business configuration
+can't relax either rule. A separate test proves an existing Google reply
+blocks publishing regardless of every other input. The risk-classifier tests
+prove the deterministic keyword scan escalates risk the model missed (e.g. a
+review mentioning a lawyer that the model scored "low") and never downgrades a
+risk level the model already assigned.
 
 ---
 
