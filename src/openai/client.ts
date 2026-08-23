@@ -6,12 +6,14 @@ import { withRetry, type RetryOptions } from "@/utils/retry";
 import { extractResponseOutput, openAiResponseEnvelopeSchema } from "@/schemas/openai";
 
 /**
- * The single path by which this application talks to OpenAI, mirroring
- * src/google/client.ts: one module owns auth, timeouts, retry, and Zod
- * validation, so no call site can accidentally skip one of them.
+ * The single path by which this application talks to its AI provider,
+ * mirroring src/google/client.ts: one module owns auth, timeouts, retry, and
+ * Zod validation, so no call site can accidentally skip one of them.
+ *
+ * "OpenAI" in this module's name is historical, not literal: OPENAI_BASE_URL
+ * points at any Responses-API-compatible host (OpenAI, Groq, etc.), selected
+ * entirely through env vars — nothing here assumes a specific provider.
  */
-
-const RESPONSES_URL = "https://api.openai.com/v1/responses";
 
 export interface OpenAiMessage {
   role: "system" | "user";
@@ -20,10 +22,10 @@ export interface OpenAiMessage {
 
 export interface StructuredRequest {
   messages: OpenAiMessage[];
-  /** Label OpenAI attaches to the schema in its own tooling. Not customer data. */
+  /** Label the provider attaches to the schema in its own tooling. Not customer data. */
   schemaName: string;
   jsonSchema: Record<string, unknown>;
-  /** Used only in our own logs/errors, never sent to OpenAI. */
+  /** Used only in our own logs/errors, never sent to the provider. */
   label?: string;
   temperature?: number;
 }
@@ -36,7 +38,7 @@ function parseRetryAfterMs(header: string | null): number | undefined {
 }
 
 /** Never includes the request body in the message: it carries review text. */
-function describeOpenAiError(status: number, rawBody: string): string {
+function describeProviderError(status: number, rawBody: string): string {
   try {
     const parsed = JSON.parse(rawBody) as { error?: { message?: string } };
     const message = parsed.error?.message;
@@ -45,9 +47,9 @@ function describeOpenAiError(status: number, rawBody: string): string {
     /* fall through */
   }
 
-  if (status === 401) return "OpenAI returned 401. Check that OPENAI_API_KEY is set and valid.";
-  if (status === 429) return "OpenAI returned 429. Rate limited, or the account is out of quota.";
-  return `OpenAI returned HTTP ${status}.`;
+  if (status === 401) return "The AI provider returned 401. Check that OPENAI_API_KEY is set and valid.";
+  if (status === 429) return "The AI provider returned 429. Rate limited, or the account is out of quota.";
+  return `The AI provider returned HTTP ${status}.`;
 }
 
 async function performRequest(request: StructuredRequest, label: string): Promise<unknown> {
@@ -56,7 +58,7 @@ async function performRequest(request: StructuredRequest, label: string): Promis
   const timeout = setTimeout(() => controller.abort(), env.OPENAI_API_TIMEOUT_MS);
 
   try {
-    const response = await fetch(RESPONSES_URL, {
+    const response = await fetch(`${env.OPENAI_BASE_URL}/responses`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${getOpenAiApiKey()}`,
@@ -72,7 +74,7 @@ async function performRequest(request: StructuredRequest, label: string): Promis
             type: "json_schema",
             name: request.schemaName,
             schema: request.jsonSchema,
-            strict: true,
+            strict: env.OPENAI_STRICT_SCHEMA,
           },
         },
       }),
@@ -83,7 +85,7 @@ async function performRequest(request: StructuredRequest, label: string): Promis
     const rawBody = await response.text();
 
     if (!response.ok) {
-      throw new OpenAiApiError(describeOpenAiError(response.status, rawBody), {
+      throw new OpenAiApiError(describeProviderError(response.status, rawBody), {
         status: response.status,
         context: { label, retryAfterMs: parseRetryAfterMs(response.headers.get("retry-after")) },
       });
@@ -92,7 +94,7 @@ async function performRequest(request: StructuredRequest, label: string): Promis
     try {
       return JSON.parse(rawBody) as unknown;
     } catch (cause) {
-      throw new SchemaValidationError("OpenAI response body was not valid JSON.", { label }, cause);
+      throw new SchemaValidationError("AI provider response body was not valid JSON.", { label }, cause);
     }
   } finally {
     clearTimeout(timeout);
@@ -103,11 +105,14 @@ async function performRequest(request: StructuredRequest, label: string): Promis
  * Issues a Structured Outputs request and validates the parsed JSON against
  * `schema` before returning it.
  *
- * A schema-validation failure is treated as retryable: with `strict: true`
- * OpenAI guarantees the JSON matches our shape, so a validation failure here
- * means the request itself didn't complete cleanly (e.g. a refusal path that
- * still exits `output` in an unexpected way) rather than a bug worth
- * repeating. Re-asking is the correct response, not re-parsing the same text.
+ * A schema-validation failure is treated as retryable. With OPENAI_STRICT_SCHEMA
+ * true on a model that supports it, the provider guarantees the JSON matches
+ * our shape, so a validation failure here means the request itself didn't
+ * complete cleanly rather than a bug worth repeating. With strict mode off (or
+ * unsupported by the configured model), the provider is only making a
+ * best-effort attempt, so a validation failure is the expected way an
+ * occasional bad generation gets caught — retrying is exactly the right
+ * response either way, not re-parsing the same text.
  */
 export async function openAiStructuredRequest<T>(
   request: StructuredRequest,
@@ -123,7 +128,7 @@ export async function openAiStructuredRequest<T>(
 
       const envelope = openAiResponseEnvelopeSchema.safeParse(body);
       if (!envelope.success) {
-        throw new SchemaValidationError("OpenAI returned data in an unexpected shape.", {
+        throw new SchemaValidationError("AI provider returned data in an unexpected shape.", {
           label,
           issues: envelope.error.issues.slice(0, 5).map((issue) => `${issue.path.join(".")}: ${issue.message}`),
         });
@@ -131,22 +136,22 @@ export async function openAiStructuredRequest<T>(
 
       const output = extractResponseOutput(envelope.data);
       if (!output) {
-        throw new SchemaValidationError("OpenAI response had no message content.", { label });
+        throw new SchemaValidationError("AI provider response had no message content.", { label });
       }
       if (output.kind === "refusal") {
-        throw new OpenAiRefusalError("OpenAI declined to generate a structured response.", { label });
+        throw new OpenAiRefusalError("The AI provider declined to generate a structured response.", { label });
       }
 
       let parsedJson: unknown;
       try {
         parsedJson = JSON.parse(output.text);
       } catch (cause) {
-        throw new SchemaValidationError("OpenAI's structured output was not valid JSON.", { label }, cause);
+        throw new SchemaValidationError("The AI provider's structured output was not valid JSON.", { label }, cause);
       }
 
       const parsed = schema.safeParse(parsedJson);
       if (!parsed.success) {
-        throw new SchemaValidationError("OpenAI's structured output failed validation.", {
+        throw new SchemaValidationError("The AI provider's structured output failed validation.", {
           label,
           issues: parsed.error.issues.slice(0, 5).map((issue) => `${issue.path.join(".")}: ${issue.message}`),
         });

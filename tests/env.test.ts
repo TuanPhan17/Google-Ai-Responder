@@ -17,6 +17,10 @@ beforeEach(() => {
   delete process.env.GOOGLE_CLIENT_ID;
   delete process.env.GOOGLE_CLIENT_SECRET;
   delete process.env.GOOGLE_OAUTH_REDIRECT_URI;
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.OPENAI_MODEL;
+  delete process.env.OPENAI_BASE_URL;
+  delete process.env.OPENAI_STRICT_SCHEMA;
   resetEnvCache();
 });
 
@@ -52,5 +56,39 @@ describe("Google OAuth env vars", () => {
     process.env.GOOGLE_OAUTH_REDIRECT_URI = "";
 
     expect(() => getEnv()).toThrow(/GOOGLE_CLIENT_ID is required/);
+  });
+});
+
+describe("AI provider env vars", () => {
+  it("defaults to OpenAI's base URL, model, and strict mode on", () => {
+    const env = getEnv();
+
+    expect(env.OPENAI_BASE_URL).toBe("https://api.openai.com/v1");
+    expect(env.OPENAI_MODEL).toBe("gpt-4o-mini");
+    expect(env.OPENAI_STRICT_SCHEMA).toBe(true);
+  });
+
+  it("switches provider entirely through env vars, e.g. to Groq", () => {
+    process.env.OPENAI_BASE_URL = "https://api.groq.com/openai/v1";
+    process.env.OPENAI_MODEL = "openai/gpt-oss-20b";
+    process.env.OPENAI_API_KEY = "gsk_test-key-not-real";
+
+    const env = getEnv();
+
+    expect(env.OPENAI_BASE_URL).toBe("https://api.groq.com/openai/v1");
+    expect(env.OPENAI_MODEL).toBe("openai/gpt-oss-20b");
+    expect(env.OPENAI_API_KEY).toBe("gsk_test-key-not-real");
+  });
+
+  it("parses OPENAI_STRICT_SCHEMA=false, for models/providers without strict-mode support", () => {
+    process.env.OPENAI_STRICT_SCHEMA = "false";
+
+    expect(getEnv().OPENAI_STRICT_SCHEMA).toBe(false);
+  });
+
+  it("rejects a malformed OPENAI_BASE_URL", () => {
+    process.env.OPENAI_BASE_URL = "not-a-url";
+
+    expect(() => getEnv()).toThrow(/OPENAI_BASE_URL/);
   });
 });

@@ -76,8 +76,22 @@ const baseSchema = z.object({
    */
   OPENAI_API_KEY: emptyToUndefined(z.string().min(1).optional()),
   OPENAI_MODEL: z.string().min(1).default("gpt-4o-mini"),
+  /**
+   * Any OpenAI-compatible Responses API endpoint. Overriding this plus
+   * OPENAI_MODEL and OPENAI_API_KEY is the entire "switch provider" story —
+   * e.g. Groq's OpenAI-compatible host at https://api.groq.com/openai/v1.
+   */
+  OPENAI_BASE_URL: z.string().url().default("https://api.openai.com/v1"),
   OPENAI_API_TIMEOUT_MS: z.coerce.number().int().positive().max(120_000).default(30_000),
   OPENAI_API_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(8).default(4),
+  /**
+   * Structured Outputs `strict: true` is a per-model capability, not a
+   * universal one — on Groq, for instance, only openai/gpt-oss-20b and
+   * openai/gpt-oss-120b support it. Set to false for a model/provider that
+   * doesn't; Zod validation (with retry-on-failure) still applies either way,
+   * so this only affects how often a bad generation needs a retry.
+   */
+  OPENAI_STRICT_SCHEMA: booleanish.default("true"),
 
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
 });
@@ -157,7 +171,7 @@ export function getGoogleOAuthConfig(): {
   };
 }
 
-/** OpenAI API key, narrowed to non-optional. Throws with setup instructions if unset. */
+/** API key for the configured AI provider, narrowed to non-optional. Throws with setup instructions if unset. */
 export function getOpenAiApiKey(): string {
   const key = getEnv().OPENAI_API_KEY;
   if (!key) {

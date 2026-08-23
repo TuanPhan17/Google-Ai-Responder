@@ -134,3 +134,56 @@ describe("openAiStructuredRequest", () => {
     await expect(callClient()).rejects.toThrow(SchemaValidationError);
   });
 });
+
+describe("provider configuration", () => {
+  it("defaults to OpenAI's Responses endpoint", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, envelopeWithText(JSON.stringify(VALID_OUTPUT))));
+
+    await callClient();
+
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://api.openai.com/v1/responses");
+  });
+
+  it("routes to Groq's OpenAI-compatible endpoint when OPENAI_BASE_URL is overridden", async () => {
+    process.env.OPENAI_BASE_URL = "https://api.groq.com/openai/v1";
+    process.env.OPENAI_MODEL = "openai/gpt-oss-20b";
+    resetEnvCache();
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, envelopeWithText(JSON.stringify(VALID_OUTPUT))));
+
+    await callClient();
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://api.groq.com/openai/v1/responses");
+    const body = JSON.parse(init.body as string);
+    expect(body.model).toBe("openai/gpt-oss-20b");
+  });
+
+  it("omits strict mode when OPENAI_STRICT_SCHEMA is false, for models that don't support it", async () => {
+    process.env.OPENAI_STRICT_SCHEMA = "false";
+    resetEnvCache();
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, envelopeWithText(JSON.stringify(VALID_OUTPUT))));
+
+    await callClient();
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.text.format.strict).toBe(false);
+  });
+
+  it("still validates and retries with Zod even when strict mode is off", async () => {
+    process.env.OPENAI_STRICT_SCHEMA = "false";
+    resetEnvCache();
+    const invalid = { ...VALID_OUTPUT, riskLevel: "extreme" };
+    fetchMock.mockImplementation(async () => jsonResponse(200, envelopeWithText(JSON.stringify(invalid))));
+
+    await expect(callClient()).rejects.toThrow(SchemaValidationError);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("falls back to a provider-neutral message on auth failure when the body has none", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(401, {}));
+
+    await expect(callClient()).rejects.toThrow(/AI provider returned 401/);
+  });
+});
