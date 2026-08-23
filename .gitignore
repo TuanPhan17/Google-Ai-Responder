@@ -1,0 +1,16 @@
+node_modules/
+.next/
+out/
+build/
+*.tsbuildinfo
+next-env.d.ts
+
+# Secrets — never commit these.
+.env
+.env.local
+.env.*.local
+*.pem
+service-account*.json
+
+.DS_Store
+coverage/
