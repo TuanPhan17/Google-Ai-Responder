@@ -20,9 +20,7 @@ For each phase:
 6. Provide a clear way to test that the phase works.
 7. Identify any Google Cloud, Google Business Profile, Supabase, or OpenAI setup that I must perform manually.
 
-Do not continue to the next phase until I explicitly ask you to.
-
-Start with **Phase 1 only**.
+Phase 1 is complete. Implement only the phase you are explicitly asked for, and stop at the phase boundary.
 
 ---
 
@@ -1055,18 +1053,12 @@ When making an architectural decision, briefly explain why you chose it.
 
 ---
 
-# Begin
+# Current state
 
-Start with **Phase 1 only**.
+Phase 1 is complete and verified: project structure, environment
+configuration, Supabase schema, Google OAuth, token storage, account and
+location retrieval, review retrieval, mock fixtures, and a working mock
+mode. Do not rebuild it.
 
-Before writing code, briefly explain:
-
-1. The Phase 1 architecture.
-2. The major components you will create.
-3. The request flow.
-4. The database tables needed at this stage.
-5. Which Google Cloud and Google Business Profile credentials or configuration I will eventually need.
-
-Then implement Phase 1 with complete code and setup instructions.
-
-Do not implement Phase 2 until I explicitly request it.
+Implement only the phase you are explicitly asked for, and stop at the
+phase boundary.
