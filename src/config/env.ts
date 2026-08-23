@@ -17,6 +17,10 @@ const booleanish = z
   .enum(["true", "false", "1", "0"])
   .transform((value) => value === "true" || value === "1");
 
+/** .env.example ships optional keys as `KEY=`, which reads as "" — treat that as unset. */
+const emptyToUndefined = <T extends z.ZodTypeAny>(schema: T) =>
+  z.preprocess((value) => (value === "" ? undefined : value), schema);
+
 /** 32 raw bytes, base64-encoded. Generate with `npm run keys:generate`. */
 const base64Key32 = z.string().refine(
   (value) => {
@@ -57,9 +61,9 @@ const baseSchema = z.object({
   /** Single shared password gating the admin console in Phase 1. */
   ADMIN_PASSWORD: z.string().min(12),
 
-  GOOGLE_CLIENT_ID: z.string().min(1).optional(),
-  GOOGLE_CLIENT_SECRET: z.string().min(1).optional(),
-  GOOGLE_OAUTH_REDIRECT_URI: z.string().url().optional(),
+  GOOGLE_CLIENT_ID: emptyToUndefined(z.string().min(1).optional()),
+  GOOGLE_CLIENT_SECRET: emptyToUndefined(z.string().min(1).optional()),
+  GOOGLE_OAUTH_REDIRECT_URI: emptyToUndefined(z.string().url().optional()),
 
   GOOGLE_API_TIMEOUT_MS: z.coerce.number().int().positive().max(120_000).default(20_000),
   GOOGLE_API_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(8).default(4),

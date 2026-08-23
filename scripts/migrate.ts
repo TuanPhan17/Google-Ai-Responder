@@ -8,8 +8,14 @@ import { config } from "dotenv";
  * Minimal forward-only migration runner.
  *
  * Deliberately not the Supabase CLI: this keeps migrations runnable in CI and
- * on a deploy host without installing another toolchain. Each file runs inside
- * a transaction and is recorded in schema_migrations, so re-running is a no-op.
+ * on a deploy host without installing another toolchain. Each file is recorded
+ * in schema_migrations, so re-running is a no-op.
+ *
+ * No sql.begin() here: Supavisor's transaction-pooler mode multiplexes
+ * connections per statement, which breaks postgres.js's session-pinned
+ * transaction wrapper (it surfaces as a misleading password-auth error, not a
+ * transaction error). Each migration file runs as a single unsafe statement,
+ * with the schema_migrations insert as a separate statement right after.
  */
 config({ path: ".env.local" });
 config({ path: ".env" });
@@ -45,10 +51,8 @@ async function main() {
 
     const contents = await readFile(join(dir, file), "utf8");
 
-    await sql.begin(async (tx) => {
-      await tx.unsafe(contents);
-      await tx`insert into schema_migrations ${sql({ name: file })}`;
-    });
+    await sql.unsafe(contents);
+    await sql`insert into schema_migrations ${sql({ name: file })}`;
 
     console.log(`✓ ${file}`);
   }

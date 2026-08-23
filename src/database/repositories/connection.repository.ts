@@ -12,6 +12,15 @@ import { DatabaseError } from "@/utils/errors";
 
 const DEFAULT_SLUG = "default";
 
+/**
+ * Fixed identity for the mock-mode stand-in connection. Mock mode still runs
+ * data through the real google_accounts/locations tables, and connection_id
+ * is a hard FK into google_connections — so this row has to actually exist,
+ * not just be referenced.
+ */
+export const MOCK_CONNECTION_ID = "00000000-0000-4000-8000-000000000000";
+const MOCK_CONNECTION_SLUG = "mock";
+
 export type ConnectionStatus = "ACTIVE" | "REVOKED" | "ERROR";
 
 export interface StoredConnection {
@@ -187,4 +196,34 @@ export async function markConnectionFailed(
 export async function deleteConnection(slug = DEFAULT_SLUG): Promise<void> {
   const { error } = await getDb().from("google_connections").delete().eq("slug", slug);
   if (error) throw new DatabaseError("Could not remove the Google connection.", { slug }, error);
+}
+
+/**
+ * Seeds the placeholder connection row mock mode points its foreign keys at.
+ *
+ * Upserts on `id` rather than checking-then-inserting, so this is safe to call
+ * on every fixture run without a race between the check and the insert.
+ * refresh_token_encrypted is `not null`, and there is no real Google refresh
+ * token in mock mode, so a dummy value is encrypted the same way a real one
+ * would be rather than bypassing the column.
+ */
+export async function ensureMockConnection(): Promise<string> {
+  const { data, error } = await getDb()
+    .from("google_connections")
+    .upsert(
+      {
+        id: MOCK_CONNECTION_ID,
+        slug: MOCK_CONNECTION_SLUG,
+        refresh_token_encrypted: encryptSecret("mock-mode-has-no-real-refresh-token"),
+        status: "ACTIVE" satisfies ConnectionStatus,
+      },
+      { onConflict: "id" },
+    )
+    .select("id")
+    .single<{ id: string }>();
+
+  if (error || !data) {
+    throw new DatabaseError("Could not seed the mock Google connection.", {}, error);
+  }
+  return data.id;
 }

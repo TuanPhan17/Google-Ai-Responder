@@ -1,4 +1,4 @@
-import { getConnection } from "@/database/repositories/connection.repository";
+import { ensureMockConnection, getConnection } from "@/database/repositories/connection.repository";
 import {
   findAccountRowId,
   upsertAccounts,
@@ -20,15 +20,14 @@ const log = logger.child("reviews.sync");
  * re-listed the org structure on every render would spend that quota on data
  * that changes roughly never.
  *
- * In mock mode there is no connection row, so a synthetic connection id keeps
- * the same code path working end to end.
+ * In mock mode there is no OAuth connection, so a placeholder google_connections
+ * row is seeded on demand — connection_id is a hard FK, and google_accounts
+ * rows still get written in mock mode, so the row has to genuinely exist.
  */
-
-const MOCK_CONNECTION_ID = "00000000-0000-4000-8000-000000000000";
 
 async function resolveConnectionId(): Promise<string> {
   const source = getReviewSource();
-  if (source.kind === "mock") return MOCK_CONNECTION_ID;
+  if (source.kind === "mock") return ensureMockConnection();
 
   const connection = await getConnection();
   if (!connection) throw new GoogleAuthError("No Google account is connected.");
