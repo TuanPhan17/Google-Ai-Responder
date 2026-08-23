@@ -6,7 +6,10 @@ import type {
   GoogleReplyState,
   LocationSummary,
   NormalizedReview,
+  PublishDecision,
   ReviewStatus,
+  RiskLevel,
+  Sentiment,
 } from "@/types/review";
 
 /**
@@ -38,11 +41,14 @@ export interface ReviewRow {
   existing_reply_updated_at: string | null;
   ai_response: string | null;
   final_response: string | null;
-  sentiment: string | null;
-  risk_level: string | null;
+  sentiment: Sentiment | null;
+  risk_level: RiskLevel | null;
   needs_human_review: boolean | null;
   ai_reason: string | null;
   referenced_details: string[];
+  ai_model: string | null;
+  publish_decision: PublishDecision | null;
+  publish_decision_reason: string | null;
   processing_attempts: number;
   last_error: string | null;
   published_at: string | null;
@@ -158,6 +164,14 @@ export async function findReview(
   return data;
 }
 
+/** Primary-key lookup, used by the processing pipeline (Phase 4), which only ever knows the internal id. */
+export async function findReviewById(reviewId: string): Promise<ReviewRow | null> {
+  const { data, error } = await getDb().from("reviews").select("*").eq("id", reviewId).maybeSingle<ReviewRow>();
+
+  if (error) throw new DatabaseError("Could not look up the review.", { reviewId }, error);
+  return data;
+}
+
 export async function insertReview(
   locationRowId: string,
   review: NormalizedReview,
@@ -237,6 +251,84 @@ export async function applyReviewEdit(
     .single<ReviewRow>();
 
   if (error || !data) throw new DatabaseError("Could not update the edited review.", { reviewId }, error);
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// AI generation / processing states (Phase 4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Moves a review into PROCESSING and records the attempt count.
+ *
+ * `nextAttempt` is computed by the caller from the row it already holds
+ * (`processing_attempts + 1`) rather than an atomic increment in SQL — this
+ * assumes a single writer per review, the same assumption the rest of this
+ * codebase already makes (see the token-refresh singleflight note). Two
+ * concurrent calls racing here is a known, accepted gap, not something this
+ * function guards against.
+ */
+export async function markProcessing(reviewId: string, nextAttempt: number): Promise<ReviewRow> {
+  const { data, error } = await getDb()
+    .from("reviews")
+    .update({ status: "PROCESSING" satisfies ReviewStatus, processing_attempts: nextAttempt })
+    .eq("id", reviewId)
+    .select("*")
+    .single<ReviewRow>();
+
+  if (error || !data) throw new DatabaseError("Could not mark the review as processing.", { reviewId }, error);
+  return data;
+}
+
+export interface GeneratedResponseUpdate {
+  aiResponse: string;
+  sentiment: Sentiment;
+  riskLevel: RiskLevel;
+  needsHumanReview: boolean;
+  aiReason: string;
+  referencedDetails: string[];
+  aiModel: string;
+  publishDecision: PublishDecision;
+  publishDecisionReason: string;
+  /** GENERATED (auto-publish eligible) or PENDING_APPROVAL — decided by the publishing policy, not here. */
+  status: ReviewStatus;
+}
+
+/** Persists a successful generation. Clears any previous last_error — this run is what counts now. */
+export async function saveGeneratedResponse(reviewId: string, update: GeneratedResponseUpdate): Promise<ReviewRow> {
+  const { data, error } = await getDb()
+    .from("reviews")
+    .update({
+      ai_response: update.aiResponse,
+      sentiment: update.sentiment,
+      risk_level: update.riskLevel,
+      needs_human_review: update.needsHumanReview,
+      ai_reason: update.aiReason,
+      referenced_details: update.referencedDetails,
+      ai_model: update.aiModel,
+      publish_decision: update.publishDecision,
+      publish_decision_reason: update.publishDecisionReason,
+      status: update.status,
+      last_error: null,
+    })
+    .eq("id", reviewId)
+    .select("*")
+    .single<ReviewRow>();
+
+  if (error || !data) throw new DatabaseError("Could not save the generated response.", { reviewId }, error);
+  return data;
+}
+
+/** Records that generation ultimately failed. The row stays FAILED until a human triggers a retry (Phase 5). */
+export async function markProcessingFailed(reviewId: string, lastError: string): Promise<ReviewRow> {
+  const { data, error } = await getDb()
+    .from("reviews")
+    .update({ status: "FAILED" satisfies ReviewStatus, last_error: lastError.slice(0, 2000) })
+    .eq("id", reviewId)
+    .select("*")
+    .single<ReviewRow>();
+
+  if (error || !data) throw new DatabaseError("Could not mark the review as failed.", { reviewId }, error);
   return data;
 }
 

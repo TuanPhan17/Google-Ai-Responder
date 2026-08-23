@@ -4,12 +4,14 @@ Receives Google Business Profile reviews, generates a personalized reply, and
 either publishes it or routes it to a human — with the publish/hold decision
 made by deterministic application code, never by the model.
 
-**Status: Phase 3 complete.** Foundation, Google OAuth, account/location/review
+**Status: Phase 4 complete.** Foundation, Google OAuth, account/location/review
 retrieval, mock fixtures, a reusable AI review-response service with
-structured-output validation, and the deterministic risk classification +
-publishing-policy service that decides auto-publish vs. human approval. Not
-yet wired into the ingest pipeline end-to-end (Phase 4 adds persistence of the
-decision, Phase 5 the approval workflow), and no writes to Google yet.
+structured-output validation, the deterministic risk classification +
+publishing-policy service, and the processing pipeline that drives a stored
+review from `RECEIVED` through generation to `GENERATED`/`PENDING_APPROVAL`/
+`FAILED` — with AI output persisted, every step audited, and a fourth
+idempotency layer so a review is never regenerated once it has one. No
+approval UI yet (Phase 5) and no writes to Google yet (Phase 6).
 
 ---
 
@@ -34,7 +36,7 @@ route to a human, regardless of what the model says.
 | `src/config` | Zod-validated env, Google endpoint constants |
 | `src/auth` | OAuth flow, token encryption, access-token refresh, admin session |
 | `src/google` | The single authorized HTTP path + accounts/locations/reviews |
-| `src/reviews` | Mapper, idempotent ingest, sync orchestration, source seam |
+| `src/reviews` | Mapper, idempotent ingest, generation/processing pipeline, sync orchestration, source seam |
 | `src/openai` | The single authorized HTTP path to OpenAI + review-response service + prompt |
 | `src/policies` | Deterministic risk classification + the publishing-policy service |
 | `src/database` | Supabase client and repositories |
@@ -213,6 +215,18 @@ blocks publishing regardless of every other input. The risk-classifier tests
 prove the deterministic keyword scan escalates risk the model missed (e.g. a
 review mentioning a lawyer that the model scored "low") and never downgrades a
 risk level the model already assigned.
+
+Phase 4 covers the processing pipeline end to end (mocking the AI client and
+repository, not a live database): a clean 5-star only auto-publishes when the
+caller explicitly supplies permissive settings, and — importantly — with no
+settings supplied at all (today's actual wiring, since Settings/Phase 8 isn't
+built) even a spotless 5-star lands in `PENDING_APPROVAL`, proving the system
+fails closed by default rather than auto-publishing by accident. Further tests
+prove risk escalation survives the full round trip into the persisted row, an
+existing Google reply still blocks regardless of settings, a review already
+past `RECEIVED` is skipped without ever calling the AI service (idempotency),
+and a generation failure lands the row in `FAILED` with the error recorded
+rather than left stuck mid-pipeline.
 
 ---
 
