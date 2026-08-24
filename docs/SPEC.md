@@ -1066,7 +1066,8 @@ When making an architectural decision, briefly explain why you chose it.
 
 # Current state
 
-Phases 1 through 6 are complete and verified. Do not rebuild any of them.
+Phases 1 through 6, the Phase 7 code-only pass, and Phase 8 are complete and
+verified. Do not rebuild any of them.
 
 * **Phase 1** — project structure, environment configuration, Supabase
   schema, Google OAuth, token storage, account and location retrieval,
@@ -1084,6 +1085,9 @@ Phases 1 through 6 are complete and verified. Do not rebuild any of them.
 * **Phase 7 (code half)** — background sweep and the auto-publish trigger,
   detailed below. The Pub/Sub half (notification webhook, Google Cloud
   config) remains outstanding.
+* **Phase 8** — the dashboard (New Reviews queue, Published history,
+  Settings) and the `business_settings` persistence layer behind it,
+  detailed below.
 
 **Standing product decision, on top of all of the above:** every review
 requires human approval before publishing — there is no automatic publish
@@ -1466,6 +1470,82 @@ ever be eligible. `recoverStalePublishPendingReviews`, the sweep's other
 pass, is unaffected and unchanged: it resolves publishes already in flight
 (human-approved or otherwise), which is an orthogonal concern to whether new
 auto-publish decisions are allowed.
+
+## Phase 8 — dashboard and configuration
+
+Two things shipped together: the `business_settings` persistence layer
+(`src/database/repositories/settings.repository.ts`,
+`src/reviews/settings.service.ts`) that every earlier phase's `BusinessContext`/
+`PublishingSettings` types were already shaped for but nothing had ever
+written to, and the dashboard UI that reads and writes it
+(`src/app/console.tsx` plus `src/app/components/*`).
+
+### Closing a gap the earlier phases left open: nothing ever called `processReview`
+
+Auditing the phases before building the dashboard surfaced that no route
+anywhere called `processReview` (`src/reviews/processing.service.ts`) — a
+RECEIVED review had no path to becoming GENERATED/PENDING_APPROVAL except
+through a test. The comment in `sync.service.ts` ("Generation (Phase 2) and
+publishing (Phase 6) hook in later") described intent that was never wired
+up. `POST /api/reviews/[id]/process` (`src/app/api/reviews/[id]/process/route.ts`)
+closes it: the dashboard's "Generate response" action on a RECEIVED row calls
+the same `processReview` function a future Pub/Sub webhook would call. It is
+not a new pipeline — it is the missing trigger for the existing one.
+
+The same audit found `edit` and `regenerate` always called their service
+functions with `business: null` — meaning configured settings never actually
+took effect even once Phase 8 existed. Both routes now look up the review's
+location and call `resolveLocationConfig` (`settings.service.ts`) before
+calling into `editReviewResponse`/`regenerateReviewResponse`, same as the new
+`process` route.
+
+### Dashboard shape
+
+Four tabs sharing one status header and one notice line
+(`src/app/console.tsx`): **New reviews** (the queue —
+`ReviewQueuePanel.tsx`), **Published** (history — `PublishedPanel.tsx`),
+**Settings** (`SettingsPanel.tsx`), and **Connection** (Phase 1's Google/
+fixtures setup, unchanged, extracted into `ConnectionPanel.tsx`). Reviews and
+Published both read one in-memory list fetched from the existing
+`GET /api/google/reviews` — two filtered views of one dataset, not two
+fetches, so a publish in one tab is immediately visible in the other.
+
+"Approve & publish" is one dashboard action that calls the existing
+`/approve` and `/publish` endpoints in sequence — there is no new combined
+backend endpoint. If publish fails or is blocked after a successful approve,
+the review is left `APPROVED` and the queue exposes a dedicated `Publish`
+(retry) and `Unapprove` action for it, rather than hiding that state.
+
+Settings is scoped to one location's `business_settings` row at a time
+(`GET /api/settings` lists locations with their settings, `PUT
+/api/settings/[locationId]` upserts one) — a multi-location business
+configures each location independently, matching the schema's
+`business_settings_location_unique` constraint.
+
+`locations.auto_publish_enabled` (the per-location kill switch column from
+the Phase 1 migration) is deliberately left unwired by this phase — the
+Settings section of this spec maps to `business_settings` fields only,
+and wiring an unused safety-relevant column into `decidePublishing` without
+being asked is exactly the kind of scope creep CLAUDE.md's safety rules
+argue against. It remains inert.
+
+### A pre-existing migration drift, found and fixed while verifying this phase
+
+Live-testing the dashboard (Approve & publish) surfaced a bug predating this
+phase: publishing failed on every attempt with `Could not mark the review
+published.` The root cause was schema drift, not application code —
+`0002_hardening.sql`'s column existed in the live database but was never
+recorded in `schema_migrations` (applied out-of-band at some point outside
+`npm run db:migrate`), which made the tracked runner refuse to proceed, which
+meant `0003_published_by.sql` (`published_by`, from the immediately preceding
+commit) had never actually been applied. `markPublished`
+(`review.repository.ts`) writes that column on every successful publish, so
+every publish failed at the database layer. Fixed by reconciling
+`schema_migrations` to match the database's actual state and then applying
+the one genuinely missing column — `npm run db:migrate` now reports all
+three migrations applied, and a full generate → approve → publish → Published
+tab round trip was verified live against the real Supabase instance and the
+configured AI provider.
 
 ### `human_review_required` — no longer load-bearing for gating, kept as an audit signal
 
