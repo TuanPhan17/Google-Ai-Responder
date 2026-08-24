@@ -165,6 +165,15 @@ export async function publishReview(
 export async function finalizeClaimedPublish(claimed: ReviewRow, actor: string): Promise<PublishReviewOutcome> {
   const reviewId = claimed.id;
   const finalResponse = claimed.final_response ?? claimed.ai_response;
+
+  // Who is actually responsible for this reply reaching Google — not
+  // `actor` (the caller of publishReview, which for the sweep is a system
+  // label like "system-sweep" and reveals nothing about who approved it).
+  // `claimed.status` is exactly what it was when this row was atomically
+  // claimed (PUBLISHABLE_STATUSES: APPROVED or GENERATED — see the module
+  // doc comment on why `status` is never touched by the claim itself), so
+  // it's the reliable signal for "did a human sign off on this."
+  const publishedBy = claimed.status === "APPROVED" ? claimed.approved_by ?? "unknown" : "auto";
   if (!finalResponse) {
     await markPublishFailed(reviewId, "No generated response text was available to publish.");
     await recordEvent(reviewId, "PUBLISH_FAILED", { reason: "no_response_text" }, actor);
@@ -180,7 +189,7 @@ export async function finalizeClaimedPublish(claimed: ReviewRow, actor: string):
 
     if (existingReply && existingReply === finalResponse) {
       const publishedAt = new Date().toISOString();
-      await markPublished(reviewId, { finalResponse, publishedAt });
+      await markPublished(reviewId, { finalResponse, publishedAt, publishedBy });
       await recordEvent(reviewId, "RESPONSE_PUBLISHED", { recovered: true }, actor);
       log.info("Publish recovered: Google already had this exact reply", { reviewId });
       return { outcome: "published", publishedAt, recovered: true };
@@ -199,7 +208,7 @@ export async function finalizeClaimedPublish(claimed: ReviewRow, actor: string):
     await source.updateReply(claimed.google_account_id, claimed.google_location_id, claimed.google_review_id, finalResponse);
 
     const publishedAt = new Date().toISOString();
-    await markPublished(reviewId, { finalResponse, publishedAt });
+    await markPublished(reviewId, { finalResponse, publishedAt, publishedBy });
     await recordEvent(reviewId, "RESPONSE_PUBLISHED", { recovered: false }, actor);
     log.info("Review published", { reviewId });
     return { outcome: "published", publishedAt, recovered: false };

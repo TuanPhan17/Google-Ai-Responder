@@ -53,6 +53,7 @@ export interface ReviewRow {
   processing_attempts: number;
   last_error: string | null;
   published_at: string | null;
+  published_by: string | null;
   approved_at: string | null;
   approved_by: string | null;
   created_at: string;
@@ -507,11 +508,13 @@ export async function claimReviewForPublishing(
  * low-risk path (GENERATED) never went through `markApproved`, so
  * `final_response` may still be null; this is the first point at which "what
  * was actually published" needs to exist as a fact independent of
- * `ai_response`.
+ * `ai_response`. `publishedBy` is the caller's job to compute (see
+ * finalizeClaimedPublish in publishing.service.ts) — this function just
+ * writes whatever it's given.
  */
 export async function markPublished(
   reviewId: string,
-  update: { finalResponse: string; publishedAt: string },
+  update: { finalResponse: string; publishedAt: string; publishedBy: string },
 ): Promise<ReviewRow> {
   const { data, error } = await getDb()
     .from("reviews")
@@ -519,6 +522,7 @@ export async function markPublished(
       status: "PUBLISHED" satisfies ReviewStatus,
       final_response: update.finalResponse,
       published_at: update.publishedAt,
+      published_by: update.publishedBy,
       google_reply_state: "PUBLISHED" satisfies GoogleReplyState,
     })
     .eq("id", reviewId)

@@ -80,6 +80,7 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     processing_attempts: 1,
     last_error: null,
     published_at: null,
+    published_by: null,
     approved_at: null,
     approved_by: null,
     created_at: "2026-01-01T00:00:00Z",
@@ -225,10 +226,34 @@ describe("recoverStalePublishPendingReviews", () => {
     expect(updateReply).toHaveBeenCalledWith("1", "1", "rev-001", "Thanks so much for the kind words!");
     expect(markPublished).toHaveBeenCalledWith(
       "review-1",
-      expect.objectContaining({ finalResponse: "Thanks so much for the kind words!" }),
+      expect.objectContaining({ finalResponse: "Thanks so much for the kind words!", publishedBy: "auto" }),
     );
     expect(recordEvent).toHaveBeenCalledWith("review-1", "RESPONSE_PUBLISHED", { recovered: false }, "system-sweep");
     expect(result).toEqual({ scanned: 1, reclaimed: 1, outcomes: { published: 1 } });
+  });
+
+  // A human-approved review can get stuck at PUBLISH_PENDING exactly the same
+  // way a GENERATED one can (approved, claimed, then the process died before
+  // recording published_at — see publishing.service.ts's module doc comment).
+  // The sweep's recovery path must credit the human who approved it, not
+  // "auto" — proves published_by survives the force-reclaim path, not just
+  // the ordinary publishReview one.
+  it("credits the approving human, not 'auto', when the sweep recovers a stuck APPROVED publish", async () => {
+    findStalePublishPendingReviewIds.mockResolvedValue(["review-1"]);
+    claimStalePublishPendingReview.mockResolvedValue(
+      reviewRow({
+        status: "APPROVED",
+        final_response: "Thanks so much for the kind words!",
+        approved_by: "jane",
+      }),
+    );
+    getReview.mockResolvedValue(googleReview());
+    updateReply.mockResolvedValue({ comment: "Thanks so much for the kind words!", updateTime: "2026-08-23T00:00:00Z" });
+
+    const { recoverStalePublishPendingReviews } = await import("@/reviews/sweep.service");
+    await recoverStalePublishPendingReviews();
+
+    expect(markPublished).toHaveBeenCalledWith("review-1", expect.objectContaining({ publishedBy: "jane" }));
   });
 
   it("recovers without reposting when Google already shows the exact reply — proof the earlier, crashed attempt's write succeeded", async () => {

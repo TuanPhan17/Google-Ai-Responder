@@ -65,6 +65,7 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     processing_attempts: 1,
     last_error: null,
     published_at: null,
+    published_by: null,
     approved_at: "2026-01-02T00:00:00Z",
     approved_by: "jane",
     created_at: "2026-01-01T00:00:00Z",
@@ -126,7 +127,7 @@ describe("publishReview", () => {
     expect(updateReply).toHaveBeenCalledWith("1", "1", "rev-001", "Thanks so much for the kind words!");
     expect(markPublished).toHaveBeenCalledWith(
       "review-1",
-      expect.objectContaining({ finalResponse: "Thanks so much for the kind words!" }),
+      expect.objectContaining({ finalResponse: "Thanks so much for the kind words!", publishedBy: "jane" }),
     );
     expect(result).toMatchObject({ outcome: "published", recovered: false });
 
@@ -146,6 +147,7 @@ describe("publishReview", () => {
     const result = await publishReview("review-1");
 
     expect(updateReply).toHaveBeenCalledWith("1", "1", "rev-001", "Thanks so much for the kind words!");
+    expect(markPublished).toHaveBeenCalledWith("review-1", expect.objectContaining({ publishedBy: "auto" }));
     expect(result).toMatchObject({ outcome: "published", recovered: false });
   });
 
@@ -220,7 +222,7 @@ describe("publishReview", () => {
     expect(updateReply).not.toHaveBeenCalled();
     expect(markPublished).toHaveBeenCalledWith(
       "review-1",
-      expect.objectContaining({ finalResponse: "Thanks so much for the kind words!" }),
+      expect.objectContaining({ finalResponse: "Thanks so much for the kind words!", publishedBy: "jane" }),
     );
     expect(result).toMatchObject({ outcome: "published", recovered: true });
 
@@ -276,6 +278,20 @@ describe("publishReview", () => {
     expect(updateReply).toHaveBeenCalledTimes(1);
     expect(markPublishFailed).toHaveBeenCalledWith("review-1", "Supabase write timed out.");
     expect(result).toEqual({ outcome: "failed", error: "Supabase write timed out." });
+  });
+
+  it("falls back to 'unknown' for published_by if an APPROVED review somehow has no approved_by recorded", async () => {
+    findReviewById.mockResolvedValue(reviewRow({ status: "APPROVED", approved_by: null }));
+    claimReviewForPublishing.mockResolvedValue(
+      reviewRow({ status: "APPROVED", approved_by: null, google_reply_state: "PUBLISH_PENDING" }),
+    );
+    getReview.mockResolvedValue(googleReview());
+    updateReply.mockResolvedValue({ comment: "Thanks so much for the kind words!", updateTime: null });
+
+    const { publishReview } = await import("@/reviews/publishing.service");
+    await publishReview("review-1");
+
+    expect(markPublished).toHaveBeenCalledWith("review-1", expect.objectContaining({ publishedBy: "unknown" }));
   });
 
   it("fails cleanly (without calling Google) when a claimed review somehow has no response text at all", async () => {

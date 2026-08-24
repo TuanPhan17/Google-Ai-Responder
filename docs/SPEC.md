@@ -1257,6 +1257,24 @@ using the mock fixtures' real review IDs so the mock `ReviewSource` resolves
 against real fixture data (including `rev-012`, the one fixture that already
 carries a reply).
 
+### `published_by` (migration `0003_published_by.sql`)
+
+A publish-time audit field, distinct from `approved_by`: `approved_by`
+records who approved a review, which can happen long before (or without ever
+leading to) an actual publish; `published_by` records who is responsible for
+the reply that actually reached Google, set exactly once, at the moment
+`finalizeClaimedPublish` (`src/reviews/publishing.service.ts`) writes it —
+whether that write happens via an ordinary claim or via the stale-row sweep's
+force-reclaim (both funnel through the same function, so both set it the same
+way). Computed from `claimed.status`, not from the `actor` string passed into
+`publishReview` (which is a caller label like `"system-sweep"`, not an
+identity): `"APPROVED"` copies that row's own `approved_by` (falling back to
+`"unknown"` if somehow absent), anything else — i.e. `"GENERATED"`, the
+deterministic auto-publish path — records the literal string `"auto"`. With
+`REQUIRE_APPROVAL_FOR_ALL` on by default (see the product decision below),
+`"auto"` should not occur in practice today, but the field exists for the
+setting it's off, or in case it audits a bug that means it wasn't.
+
 ## Phase 7 (code-only pass) — background sweep and auto-publish trigger
 
 This pass implements only the two code-side gaps Phase 6 and the "Known

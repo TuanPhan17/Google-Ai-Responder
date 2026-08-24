@@ -298,7 +298,11 @@ describe("claimReviewForPublishing", () => {
 describe("markPublished", () => {
   it("sets status PUBLISHED, stamps final_response/published_at, and only writes over a held PUBLISH_PENDING claim", async () => {
     const { markPublished } = await import("@/database/repositories/review.repository");
-    await markPublished("review-1", { finalResponse: "Thanks!", publishedAt: "2026-08-20T00:00:00.000Z" });
+    await markPublished("review-1", {
+      finalResponse: "Thanks!",
+      publishedAt: "2026-08-20T00:00:00.000Z",
+      publishedBy: "jane",
+    });
 
     const [update] = fakeDb.updates;
     expect(update?.table).toBe("reviews");
@@ -307,6 +311,7 @@ describe("markPublished", () => {
       status: "PUBLISHED",
       final_response: "Thanks!",
       published_at: "2026-08-20T00:00:00.000Z",
+      published_by: "jane",
       google_reply_state: "PUBLISHED",
     });
   });
@@ -317,7 +322,11 @@ describe("markPublished", () => {
 
     const { markPublished } = await import("@/database/repositories/review.repository");
     await expect(
-      markPublished("review-1", { finalResponse: "Thanks!", publishedAt: "2026-08-20T00:00:00.000Z" }),
+      markPublished("review-1", {
+        finalResponse: "Thanks!",
+        publishedAt: "2026-08-20T00:00:00.000Z",
+        publishedBy: "jane",
+      }),
     ).rejects.toThrow(ConflictError);
   });
 });

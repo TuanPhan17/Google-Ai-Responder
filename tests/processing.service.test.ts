@@ -69,6 +69,7 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     processing_attempts: 0,
     last_error: null,
     published_at: null,
+    published_by: null,
     approved_at: null,
     approved_by: null,
     created_at: "2026-01-01T00:00:00Z",
