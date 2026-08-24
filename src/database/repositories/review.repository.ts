@@ -332,6 +332,65 @@ export async function markProcessingFailed(reviewId: string, lastError: string):
   return data;
 }
 
+// ---------------------------------------------------------------------------
+// Approval workflow (Phase 5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Marks a review approved. `finalResponse` is decided by the service layer —
+ * the AI draft if untouched, or whatever a human last edited it to — never
+ * computed here, so this function has no opinion about which one wins.
+ */
+export async function markApproved(
+  reviewId: string,
+  update: { finalResponse: string; approvedBy: string },
+): Promise<ReviewRow> {
+  const { data, error } = await getDb()
+    .from("reviews")
+    .update({
+      status: "APPROVED" satisfies ReviewStatus,
+      final_response: update.finalResponse,
+      approved_by: update.approvedBy,
+      approved_at: new Date().toISOString(),
+    })
+    .eq("id", reviewId)
+    .select("*")
+    .single<ReviewRow>();
+
+  if (error || !data) throw new DatabaseError("Could not approve the review.", { reviewId }, error);
+  return data;
+}
+
+export async function markRejected(reviewId: string): Promise<ReviewRow> {
+  const { data, error } = await getDb()
+    .from("reviews")
+    .update({ status: "REJECTED" satisfies ReviewStatus })
+    .eq("id", reviewId)
+    .select("*")
+    .single<ReviewRow>();
+
+  if (error || !data) throw new DatabaseError("Could not reject the review.", { reviewId }, error);
+  return data;
+}
+
+/**
+ * Saves a human-edited draft. Always routes back through PENDING_APPROVAL —
+ * even a review that was auto-publish-eligible (GENERATED) requires an
+ * explicit approval after a human has touched the text, rather than letting
+ * Phase 6 auto-publish an edit the deterministic policy never evaluated.
+ */
+export async function updateFinalResponse(reviewId: string, finalResponse: string): Promise<ReviewRow> {
+  const { data, error } = await getDb()
+    .from("reviews")
+    .update({ final_response: finalResponse, status: "PENDING_APPROVAL" satisfies ReviewStatus })
+    .eq("id", reviewId)
+    .select("*")
+    .single<ReviewRow>();
+
+  if (error || !data) throw new DatabaseError("Could not save the edited response.", { reviewId }, error);
+  return data;
+}
+
 /** Snapshots the customer's previous text before an edit overwrites it. */
 export async function recordRevision(reviewId: string, row: ReviewRow): Promise<void> {
   const { error } = await getDb().from("review_revisions").insert({

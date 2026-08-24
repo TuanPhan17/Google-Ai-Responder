@@ -75,6 +75,23 @@ export async function processReview(
     return { outcome: "skipped", reason: "not_in_received_state", status: review.status };
   }
 
+  return runReviewGeneration(review, { actor, business, settings });
+}
+
+/**
+ * The AI-call → deterministic-evaluate → persist → audit pipeline, shared by
+ * `processReview` (RECEIVED-only, Phase 4) and the approval workflow's
+ * `regenerateReviewResponse` (Phase 5, any eligible non-RECEIVED status).
+ * Eligibility is the caller's responsibility — this function only requires a
+ * row that already exists.
+ */
+export async function runReviewGeneration(
+  review: ReviewRow,
+  options: { actor: string; business: BusinessContext | null; settings: PublishingSettings | null },
+): Promise<ProcessReviewOutcome> {
+  const { actor, business, settings } = options;
+  const reviewId = review.id;
+
   const processing = await markProcessing(reviewId, review.processing_attempts + 1);
   await recordEvent(reviewId, "AI_GENERATION_STARTED", { attempt: processing.processing_attempts }, actor);
 

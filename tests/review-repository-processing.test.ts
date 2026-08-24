@@ -121,3 +121,43 @@ describe("markProcessingFailed", () => {
     expect((update?.payload.last_error as string).length).toBe(2000);
   });
 });
+
+describe("markApproved", () => {
+  it("sets status APPROVED and stamps the final response, approver, and timestamp", async () => {
+    const { markApproved } = await import("@/database/repositories/review.repository");
+    await markApproved("review-1", { finalResponse: "Thanks!", approvedBy: "jane" });
+
+    const [update] = fakeDb.updates;
+    expect(update?.table).toBe("reviews");
+    expect(update?.payload).toMatchObject({
+      status: "APPROVED",
+      final_response: "Thanks!",
+      approved_by: "jane",
+    });
+    expect(typeof update?.payload.approved_at).toBe("string");
+  });
+});
+
+describe("markRejected", () => {
+  it("sets status REJECTED", async () => {
+    const { markRejected } = await import("@/database/repositories/review.repository");
+    await markRejected("review-1");
+
+    expect(fakeDb.updates).toEqual([{ table: "reviews", id: "review-1", payload: { status: "REJECTED" } }]);
+  });
+});
+
+describe("updateFinalResponse", () => {
+  it("saves the edited text and resets status to PENDING_APPROVAL", async () => {
+    const { updateFinalResponse } = await import("@/database/repositories/review.repository");
+    await updateFinalResponse("review-1", "A hand-edited reply.");
+
+    expect(fakeDb.updates).toEqual([
+      {
+        table: "reviews",
+        id: "review-1",
+        payload: { final_response: "A hand-edited reply.", status: "PENDING_APPROVAL" },
+      },
+    ]);
+  });
+});
