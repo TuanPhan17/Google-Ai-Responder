@@ -3,18 +3,38 @@ import { describe, expect, it } from "vitest";
 import { evaluateReviewForPublishing } from "@/policies/evaluate-review";
 
 describe("evaluateReviewForPublishing", () => {
-  it("auto-publishes a genuinely clean 5-star review", () => {
+  it("auto-publishes a genuinely clean 5-star review when the blanket approval requirement is off", () => {
     const result = evaluateReviewForPublishing({
       rating: 5,
       reviewText: "Fast, friendly, and fair pricing. Highly recommend!",
       hasExistingGoogleReply: false,
       aiOutput: { riskLevel: "low", needsHumanReview: false },
       settings: { autoPublishFiveStar: true, autoPublishFourStar: true, minAutoPublishRating: 4 },
+      requireApprovalForAll: false,
     });
 
     expect(result.decision).toBe("AUTO_PUBLISH");
     expect(result.riskLevel).toBe("low");
     expect(result.keywordMatches).toEqual([]);
+  });
+
+  // Product decision: every review requires human approval before
+  // publishing (REQUIRE_APPROVAL_FOR_ALL in src/config/env.ts, default
+  // true). Even a spotless 5-star review with fully permissive settings
+  // must still land in REQUIRE_APPROVAL when the caller doesn't explicitly
+  // opt out of that default.
+  it("still requires approval for a genuinely clean 5-star review when requireApprovalForAll defaults to true", () => {
+    const result = evaluateReviewForPublishing({
+      rating: 5,
+      reviewText: "Fast, friendly, and fair pricing. Highly recommend!",
+      hasExistingGoogleReply: false,
+      aiOutput: { riskLevel: "low", needsHumanReview: false },
+      settings: { autoPublishFiveStar: true, autoPublishFourStar: true, minAutoPublishRating: 4 },
+      // requireApprovalForAll omitted on purpose.
+    });
+
+    expect(result.decision).toBe("REQUIRE_APPROVAL");
+    expect(result.reasons).toContain("manual_approval_required");
   });
 
   it("routes a 5-star review to approval when the text itself contains a legal threat, even if the model missed it", () => {
@@ -64,6 +84,9 @@ describe("evaluateReviewForPublishing", () => {
       hasExistingGoogleReply: false,
       aiOutput: { riskLevel: "low" as const, needsHumanReview: false },
       settings: { autoPublishFiveStar: true, autoPublishFourStar: true, minAutoPublishRating: 4 },
+      // Off here so these tests isolate the sticky-flag mechanic under test
+      // from the separate, blanket REQUIRE_APPROVAL_FOR_ALL product decision.
+      requireApprovalForAll: false,
     };
 
     it("is false, and does not require approval, on a first attempt with no prior flag and a clean signal", () => {

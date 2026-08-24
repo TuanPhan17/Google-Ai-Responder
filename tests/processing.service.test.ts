@@ -86,6 +86,9 @@ beforeEach(() => {
   process.env.MOCK_MODE = "true";
   process.env.OPENAI_API_KEY = "test-key-not-real";
   process.env.OPENAI_MODEL = "gpt-4o-mini";
+  // Reset to the production default (unset -> true) each test; the one test
+  // that needs it off sets it explicitly for itself.
+  delete process.env.REQUIRE_APPROVAL_FOR_ALL;
   resetEnvCache();
 
   findReviewById.mockReset();
@@ -117,7 +120,9 @@ function mockStoredReview(row: ReviewRow) {
 const PERMISSIVE_SETTINGS = { autoPublishFiveStar: true, autoPublishFourStar: true, minAutoPublishRating: 4 };
 
 describe("processReview", () => {
-  it("auto-publishes a genuinely clean 5-star review when settings allow it", async () => {
+  it("auto-publishes a genuinely clean 5-star review when settings allow it and REQUIRE_APPROVAL_FOR_ALL is off", async () => {
+    process.env.REQUIRE_APPROVAL_FOR_ALL = "false";
+    resetEnvCache();
     mockStoredReview(reviewRow());
     generateReviewResponse.mockResolvedValue(CLEAN_AI_OUTPUT);
 
@@ -153,6 +158,24 @@ describe("processReview", () => {
     const result = await processReview("review-1");
 
     expect(result).toMatchObject({ status: "PENDING_APPROVAL", decision: "REQUIRE_APPROVAL" });
+  });
+
+  // Product decision: every review requires human approval before
+  // publishing (REQUIRE_APPROVAL_FOR_ALL, default true — src/config/env.ts).
+  // Unlike the test above, this one proves the blanket requirement holds
+  // even when settings *would* otherwise allow auto-publishing — it isn't
+  // just "no settings configured yet."
+  it("still requires approval for a genuinely clean 5-star review even with fully permissive settings, because REQUIRE_APPROVAL_FOR_ALL defaults to true", async () => {
+    mockStoredReview(reviewRow());
+    generateReviewResponse.mockResolvedValue(CLEAN_AI_OUTPUT);
+
+    const { processReview } = await import("@/reviews/processing.service");
+    const result = await processReview("review-1", { settings: PERMISSIVE_SETTINGS });
+
+    expect(result).toEqual({ outcome: "generated", status: "PENDING_APPROVAL", decision: "REQUIRE_APPROVAL" });
+
+    const [, update] = saveGeneratedResponse.mock.calls[0] as [string, Record<string, unknown>];
+    expect(update.publishDecisionReason).toContain("manual_approval_required");
   });
 
   it("never marks a 1-star review GENERATED-for-auto-publish, even with a spotless AI classification", async () => {

@@ -84,6 +84,7 @@ beforeEach(() => {
   process.env.MOCK_MODE = "true";
   process.env.OPENAI_API_KEY = "test-key-not-real";
   process.env.OPENAI_MODEL = "gpt-4o-mini";
+  delete process.env.REQUIRE_APPROVAL_FOR_ALL;
   resetEnvCache();
 
   findReviewById.mockReset();

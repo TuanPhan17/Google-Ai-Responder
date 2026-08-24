@@ -110,6 +110,11 @@ beforeEach(() => {
   process.env.OPENAI_MODEL = "gpt-4o-mini";
   delete process.env.GOOGLE_API_TIMEOUT_MS;
   delete process.env.GOOGLE_API_MAX_ATTEMPTS;
+  // Off by default in this file so the existing sweep-mechanics tests below
+  // (claim races, batch tallying, limits) keep exercising the underlying
+  // auto-publish engine, same as before REQUIRE_APPROVAL_FOR_ALL existed.
+  // The one test that needs the shipped default (true) sets it explicitly.
+  process.env.REQUIRE_APPROVAL_FOR_ALL = "false";
   resetEnvCache();
 
   findAutoPublishEligibleReviewIds.mockReset();
@@ -183,6 +188,25 @@ describe("publishEligibleGeneratedReviews", () => {
     await publishEligibleGeneratedReviews(5);
 
     expect(findAutoPublishEligibleReviewIds).toHaveBeenCalledWith(5);
+  });
+
+  // Product decision: every review requires human approval before
+  // publishing (REQUIRE_APPROVAL_FOR_ALL, default true — src/config/env.ts).
+  // With it on, GENERATED rows can't be created by the normal pipeline any
+  // more, but this function checks the flag directly rather than relying on
+  // that emergent behavior — see its doc comment for why (a stale GENERATED
+  // row left over from before the flag was turned on). Proves the guard
+  // short-circuits before even querying the repository.
+  it("finds nothing eligible, without querying, when REQUIRE_APPROVAL_FOR_ALL is on (the shipped default)", async () => {
+    process.env.REQUIRE_APPROVAL_FOR_ALL = "true";
+    resetEnvCache();
+
+    const { publishEligibleGeneratedReviews } = await import("@/reviews/sweep.service");
+    const result = await publishEligibleGeneratedReviews();
+
+    expect(findAutoPublishEligibleReviewIds).not.toHaveBeenCalled();
+    expect(publishReview).not.toHaveBeenCalled();
+    expect(result).toEqual({ scanned: 0, outcomes: {} });
   });
 });
 

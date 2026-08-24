@@ -92,3 +92,15 @@ describe("AI provider env vars", () => {
     expect(() => getEnv()).toThrow(/OPENAI_BASE_URL/);
   });
 });
+
+describe("REQUIRE_APPROVAL_FOR_ALL", () => {
+  it("defaults to true — every review requires human approval, matching the shipped product decision", () => {
+    expect(getEnv().REQUIRE_APPROVAL_FOR_ALL).toBe(true);
+  });
+
+  it("parses REQUIRE_APPROVAL_FOR_ALL=false, for reverting to the auto-publish policy engine", () => {
+    process.env.REQUIRE_APPROVAL_FOR_ALL = "false";
+
+    expect(getEnv().REQUIRE_APPROVAL_FOR_ALL).toBe(false);
+  });
+});

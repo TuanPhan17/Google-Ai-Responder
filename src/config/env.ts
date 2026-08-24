@@ -94,6 +94,18 @@ const baseSchema = z.object({
   OPENAI_STRICT_SCHEMA: booleanish.default("true"),
 
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+
+  /**
+   * Product-level kill switch, independent of `business_settings` and
+   * independent of the deterministic auto-publish machinery in
+   * src/policies/publishing-policy.ts. Defaults to true: every review
+   * requires a human's explicit approval before anything reaches Google —
+   * there is no automatic publish path in the shipped product. The
+   * auto-publish logic still exists and is still exercised by its own tests;
+   * this is the only thing standing between it and actually running. Set to
+   * false to deliberately reverse that product decision.
+   */
+  REQUIRE_APPROVAL_FOR_ALL: booleanish.default("true"),
 });
 
 const envSchema = baseSchema.superRefine((value, ctx) => {

@@ -87,8 +87,24 @@ function tally(outcomes: SweepBatchResult["outcomes"], key: keyof SweepBatchResu
  * concurrent sweep tick) already claimed in the meantime just loses that
  * race cleanly — `ConflictError` — and is tallied as `skipped`, not an
  * error worth stopping the batch for.
+ *
+ * With `REQUIRE_APPROVAL_FOR_ALL` on (the shipped default — see
+ * src/config/env.ts), `decidePublishing` never returns `AUTO_PUBLISH`, so no
+ * review can reach GENERATED status through the normal generation pipeline
+ * any more; the query below would come back empty on its own. This function
+ * checks the flag directly anyway, before querying, for the same reason
+ * `publishReview` re-checks Google's live reply instead of trusting a status
+ * read moments earlier: a GENERATED row that predates this flag being turned
+ * on — leftover from before this product decision, or written by a seed/test
+ * script — must not be treated as still-eligible just because the row
+ * exists and the flag happens to currently be off elsewhere.
  */
 export async function publishEligibleGeneratedReviews(limit = DEFAULT_BATCH_LIMIT): Promise<SweepBatchResult> {
+  if (getEnv().REQUIRE_APPROVAL_FOR_ALL) {
+    log.debug("Auto-publish sweep skipped entirely: REQUIRE_APPROVAL_FOR_ALL is on");
+    return { scanned: 0, outcomes: {} };
+  }
+
   const ids = await findAutoPublishEligibleReviewIds(limit);
   const outcomes: SweepBatchResult["outcomes"] = {};
 

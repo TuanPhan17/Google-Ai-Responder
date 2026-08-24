@@ -18,6 +18,16 @@ import type { PublishDecision, RiskLevel } from "@/types/review";
  * nothing here reads from anything the model produced except the risk signal
  * itself, and that signal already went through the deterministic keyword
  * escalation in risk-classifier.ts before it ever reaches this function.
+ *
+ * On top of all of that sits `requireApprovalForAll` — a separate,
+ * product-level decision (see REQUIRE_APPROVAL_FOR_ALL in src/config/env.ts)
+ * that every review requires human approval, full stop. It defaults to
+ * `true` when a caller doesn't pass it, matching that product default. It is
+ * deliberately still just an input to this function rather than this
+ * function deleting or bypassing the auto-publish machinery below: the
+ * policy engine keeps working exactly as before and stays fully covered by
+ * its own tests, so turning auto-publish back on later is a config change,
+ * not a rewrite.
  */
 
 export interface PublishingPolicyInput {
@@ -27,6 +37,8 @@ export interface PublishingPolicyInput {
   hasExistingGoogleReply: boolean;
   /** Null when no business_settings row exists yet — treated as the safe default (nothing auto-publishes). */
   settings?: PublishingSettings | null;
+  /** Defaults to `true` (require approval for everything) when omitted — see REQUIRE_APPROVAL_FOR_ALL in src/config/env.ts. */
+  requireApprovalForAll?: boolean;
 }
 
 export interface PublishingPolicyResult {
@@ -49,6 +61,11 @@ export function decidePublishing(input: PublishingPolicyInput): PublishingPolicy
   }
 
   const mandatoryReasons: string[] = [];
+
+  // The blanket product decision, checked first because it's the most
+  // decisive reason when it applies — it holds regardless of rating, risk,
+  // or settings, unlike every other entry pushed onto this array below.
+  if (input.requireApprovalForAll ?? true) mandatoryReasons.push("manual_approval_required");
 
   if (input.rating === null) mandatoryReasons.push("rating_unknown");
   else if (input.rating <= 3) mandatoryReasons.push("rating_requires_approval");

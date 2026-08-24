@@ -17,6 +17,13 @@ function baseInput(overrides: Partial<PublishingPolicyInput> = {}): PublishingPo
     needsHumanReview: false,
     hasExistingGoogleReply: false,
     settings: PERMISSIVE_SETTINGS,
+    // The rest of this file's inputs are already maximally permissive
+    // (PERMISSIVE_SETTINGS, low risk, no existing reply) specifically to
+    // exercise the underlying auto-publish engine — so this default opts
+    // out of the separate, blanket REQUIRE_APPROVAL_FOR_ALL product decision
+    // too. Its own default (decidePublishing treats an omitted value as
+    // `true`) is covered by the "product decision" describe block below.
+    requireApprovalForAll: false,
     ...overrides,
   };
 }
@@ -42,11 +49,15 @@ describe("decidePublishing — mandatory safety invariants", () => {
       for (const riskLevel of riskLevels) {
         for (const needsHumanReview of [true, false]) {
           for (const settings of settingsOptions) {
-            const result = decidePublishing(baseInput({ rating, riskLevel, needsHumanReview, settings }));
-            expect(
-              result.decision,
-              `rating=${rating} risk=${riskLevel} needsHumanReview=${needsHumanReview} settings=${JSON.stringify(settings)}`,
-            ).not.toBe("AUTO_PUBLISH");
+            for (const requireApprovalForAll of [true, false]) {
+              const result = decidePublishing(
+                baseInput({ rating, riskLevel, needsHumanReview, settings, requireApprovalForAll }),
+              );
+              expect(
+                result.decision,
+                `rating=${rating} risk=${riskLevel} needsHumanReview=${needsHumanReview} settings=${JSON.stringify(settings)} requireApprovalForAll=${requireApprovalForAll}`,
+              ).not.toBe("AUTO_PUBLISH");
+            }
           }
         }
       }
@@ -137,5 +148,45 @@ describe("decidePublishing — the auto-publish happy path", () => {
     );
     expect(result.decision).toBe("REQUIRE_APPROVAL");
     expect(result.reasons).toContain("below_min_auto_publish_rating");
+  });
+});
+
+// Product decision: every review requires human approval before publishing.
+// There is no automatic publish path in the shipped product — see
+// REQUIRE_APPROVAL_FOR_ALL in src/config/env.ts and docs/SPEC.md. The
+// auto-publish engine above still exists and is still fully exercised by its
+// own tests; `requireApprovalForAll` is the only thing gating it off.
+describe("decidePublishing — REQUIRE_APPROVAL_FOR_ALL (manual approval for everything)", () => {
+  it("requires approval for an otherwise-ideal 5-star review when requireApprovalForAll is omitted (defaults to true)", () => {
+    const result = decidePublishing({
+      rating: 5,
+      riskLevel: "low",
+      needsHumanReview: false,
+      hasExistingGoogleReply: false,
+      settings: PERMISSIVE_SETTINGS,
+      // requireApprovalForAll deliberately omitted — this is the production default.
+    });
+
+    expect(result.decision).toBe("REQUIRE_APPROVAL");
+    expect(result.reasons).toContain("manual_approval_required");
+  });
+
+  it("requires approval for a spotless 5-star review even with fully permissive settings when the flag is explicitly true", () => {
+    const result = decidePublishing(baseInput({ requireApprovalForAll: true }));
+
+    expect(result.decision).toBe("REQUIRE_APPROVAL");
+    expect(result.reasons).toEqual(["manual_approval_required"]);
+  });
+
+  it("still auto-publishes a spotless 5-star review when the flag is explicitly turned off", () => {
+    const result = decidePublishing(baseInput({ requireApprovalForAll: false }));
+
+    expect(result.decision).toBe("AUTO_PUBLISH");
+  });
+
+  it("still blocks over an existing Google reply even when the flag is off", () => {
+    const result = decidePublishing(baseInput({ requireApprovalForAll: false, hasExistingGoogleReply: true }));
+
+    expect(result.decision).toBe("BLOCKED");
   });
 });

@@ -29,6 +29,8 @@ export interface EvaluateReviewInput {
    * flag can only turn on, never off, across generations of the same review.
    */
   priorHumanReviewRequired?: boolean;
+  /** Passed straight through to decidePublishing; see its doc comment. Defaults to `true` when omitted. */
+  requireApprovalForAll?: boolean;
 }
 
 export interface EvaluateReviewResult {
@@ -57,6 +59,7 @@ export function evaluateReviewForPublishing(input: EvaluateReviewInput): Evaluat
     needsHumanReview: humanReviewRequired,
     hasExistingGoogleReply: input.hasExistingGoogleReply,
     settings: input.settings,
+    requireApprovalForAll: input.requireApprovalForAll,
   });
 
   return {

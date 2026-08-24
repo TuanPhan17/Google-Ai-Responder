@@ -107,6 +107,7 @@ export async function runReviewGeneration(
       aiOutput: { riskLevel: aiOutput.riskLevel, needsHumanReview: aiOutput.needsHumanReview },
       settings,
       priorHumanReviewRequired: review.human_review_required,
+      requireApprovalForAll: getEnv().REQUIRE_APPROVAL_FOR_ALL,
     });
 
     const status: ReviewStatus = evaluation.decision === "AUTO_PUBLISH" ? "GENERATED" : "PENDING_APPROVAL";

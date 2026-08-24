@@ -1081,6 +1081,15 @@ Phases 1 through 6 are complete and verified. Do not rebuild any of them.
   plus a hardening pass on top of it, detailed below.
 * **Phase 6** — publishing to Google (`src/reviews/publishing.service.ts`,
   `POST /api/reviews/[id]/publish`), detailed below.
+* **Phase 7 (code half)** — background sweep and the auto-publish trigger,
+  detailed below. The Pub/Sub half (notification webhook, Google Cloud
+  config) remains outstanding.
+
+**Standing product decision, on top of all of the above:** every review
+requires human approval before publishing — there is no automatic publish
+path in the shipped product. See "Product decision (2026-08-23): manual
+approval for every review," below, for the `REQUIRE_APPROVAL_FOR_ALL` flag,
+what it changed, and what it deliberately left alone.
 
 Implement only the phase you are explicitly asked for, and stop at the
 phase boundary.
@@ -1364,3 +1373,100 @@ workflow) is exactly the infrastructure this pass was told not to set up.
 race and already-resolved-candidate cases, with the repository and the live
 Google check mocked the same way `tests/publishing.service.test.ts` mocks
 them for `publishReview` itself.
+
+## Product decision (2026-08-23): manual approval for every review
+
+This is a deliberate, standing product decision, not a temporary setting:
+**every review requires a human's explicit approval before anything reaches
+Google.** There is no automatic publish path in the shipped product. It does
+not touch the still-outstanding Pub/Sub half of Phase 7 (the notification
+webhook and its Google Cloud configuration remain a separate, deferred pass —
+see "What Phase 7 (code-only pass) does not do" above); it only changes what
+the deterministic policy is allowed to decide once a review does get
+processed, by whatever eventually triggers that.
+
+### `REQUIRE_APPROVAL_FOR_ALL` (`src/config/env.ts`, default `true`)
+
+A product-level kill switch, independent of `business_settings` and
+independent of the deterministic auto-publish machinery in
+`src/policies/publishing-policy.ts`. It is implemented as a config flag
+rather than by deleting or bypassing the auto-publish engine: `decidePublishing`
+still contains every rule described earlier in this document (1-3 star never
+auto-publishes, medium/high risk never auto-publishes, an existing reply
+always blocks), and all of that is still exercised by its own tests. The flag
+is simply one more mandatory reason `decidePublishing` checks before it will
+ever return `AUTO_PUBLISH` — the same shape as the rating and risk checks
+already there, not a special case bolted on top. Flipping it to `false` is
+what reactivates the auto-publish path; nothing else needs to change to do
+that.
+
+`decidePublishing`'s own default when the field is omitted is `true` (fail
+safe: a caller that forgets to pass it gets the stricter behavior, not the
+looser one). `PublishingPolicyInput.requireApprovalForAll` and
+`EvaluateReviewInput.requireApprovalForAll`
+(`src/policies/evaluate-review.ts`) are plain pass-through fields — neither
+file reads `getEnv()` itself, keeping both policy layers pure and testable
+without env setup, consistent with `evaluate-review.ts`'s existing
+"pure and side-effect-free on purpose" design. The one production caller,
+`runReviewGeneration` (`src/reviews/processing.service.ts`), already reads
+`getEnv()` for `OPENAI_MODEL`, so it is where the env value is actually read
+and threaded in — both `processReview` and the regenerate path
+(`regenerateReviewResponse` in `src/reviews/approval.service.ts`) share that
+one function, so both go through the same gate.
+
+When the flag is on, `decidePublishing`'s reasons array always includes
+`manual_approval_required`, most-decisive-first, alongside whatever other
+mandatory reasons apply (`rating_requires_approval`, `risk_high`,
+`needs_human_review`, etc., when those also fire) — so the dashboard's "why
+human approval is required" display doesn't lose the more specific reasons
+just because the blanket one is also true.
+
+### `publishEligibleGeneratedReviews` (`src/reviews/sweep.service.ts`)
+
+With the flag on, no review can reach `GENERATED` status through the normal
+generation pipeline any more (`runReviewGeneration` only sets that status
+when the decision is `AUTO_PUBLISH`), so this function's candidate query
+would come back empty on its own. It does not rely on that emergent
+behavior, though: it checks `REQUIRE_APPROVAL_FOR_ALL` directly and returns
+`{ scanned: 0, outcomes: {} }` before even querying the repository. This
+matters for a scenario the emergent behavior alone doesn't cover — a
+`GENERATED` row that predates this flag being turned on (leftover from
+before this product decision, or written by a seed/test script) must not be
+treated as still-eligible just because the row exists. It's the same
+defense-in-depth instinct as `publishReview` re-checking Google's live reply
+state instead of trusting a status read moments earlier, applied one layer
+up.
+
+**Is `publishEligibleGeneratedReviews` dead code now?** Not dead, but inert
+under the shipped default. It still has a purpose: it's what makes flipping
+`REQUIRE_APPROVAL_FOR_ALL` back to `false` a complete reversal rather than a
+partial one, and it's still directly exercised by its own tests (including a
+dedicated test that the guard short-circuits before querying at all). But in
+the configuration this product actually ships with today, it is a guarded
+no-op — nothing calls it that matters, because nothing it could find would
+ever be eligible. `recoverStalePublishPendingReviews`, the sweep's other
+pass, is unaffected and unchanged: it resolves publishes already in flight
+(human-approved or otherwise), which is an orthogonal concern to whether new
+auto-publish decisions are allowed.
+
+### `human_review_required` — no longer load-bearing for gating, kept as an audit signal
+
+Before this decision, `human_review_required` (the sticky, `false -> true`
+only flag from the Phase 5 hardening pass — see above) was one of the inputs
+`decidePublishing` needed to correctly decide `AUTO_PUBLISH` vs
+`REQUIRE_APPROVAL`. It still feeds into that decision exactly as before
+(`priorHumanReviewRequired` in `evaluate-review.ts`), but with
+`REQUIRE_APPROVAL_FOR_ALL` defaulting to `true`, the decision no longer
+depends on it: `manual_approval_required` alone is enough to force
+`REQUIRE_APPROVAL` regardless of what `human_review_required` says.
+
+It is kept, not removed, for two reasons. First, it remains genuinely
+informative: it is the per-review signal for *why* a review needs a careful
+human look, as opposed to merely needing the click-through every review now
+requires — the dashboard can still use it (once Phase 8 builds the dashboard
+surface for it) to distinguish "flagged risky, read this carefully" from
+"routine 5-star, rubber-stamp is probably fine." Second, it stays load-bearing
+the moment `REQUIRE_APPROVAL_FOR_ALL` is ever set back to `false` — removing
+the column or its computation now would mean rebuilding it later just to
+re-enable auto-publish safely. No schema or code change was made to it beyond
+what already existed; this section only documents its changed role.
