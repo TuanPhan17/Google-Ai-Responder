@@ -1055,10 +1055,80 @@ When making an architectural decision, briefly explain why you chose it.
 
 # Current state
 
-Phase 1 is complete and verified: project structure, environment
-configuration, Supabase schema, Google OAuth, token storage, account and
-location retrieval, review retrieval, mock fixtures, and a working mock
-mode. Do not rebuild it.
+Phases 1 through 5 are complete and verified. Do not rebuild any of them.
+
+* **Phase 1** — project structure, environment configuration, Supabase
+  schema, Google OAuth, token storage, account and location retrieval,
+  review retrieval, mock fixtures, and a working mock mode.
+* **Phase 2** — OpenAI Responses API integration, structured-output schema,
+  Zod validation, personalization logic.
+* **Phase 3** — deterministic risk classification and the publishing-policy
+  service (`src/policies/publishing-policy.ts`).
+* **Phase 4** — review persistence, processing states, idempotent upserts,
+  and audit logging.
+* **Phase 5** — the approval workflow (approve, edit, regenerate, reject),
+  plus a hardening pass on top of it, detailed below.
 
 Implement only the phase you are explicitly asked for, and stop at the
 phase boundary.
+
+## Phase 5 hardening (implemented)
+
+After the initial approval workflow shipped, a hardening pass closed two
+gaps: a regenerate could silently downgrade a review's human-review
+requirement, and concurrent writes to the same review could clobber each
+other without either caller knowing. Migration:
+`supabase/migrations/0002_hardening.sql`.
+
+### `human_review_required` vs `needs_human_review`
+
+`needs_human_review` (boolean, nullable) is a **per-attempt signal**. Every
+generation or regeneration overwrites it with whatever that single attempt's
+model output plus deterministic keyword scan concluded
+(`src/policies/evaluate-review.ts`). It is informational and can move in
+either direction — a regenerate that gets a rosier model opinion the second
+time around will happily set it back to `false`.
+
+The publishing decision does not read that field directly, because a
+rosier second opinion erasing a risk flag the first attempt raised — with
+nobody having actually reviewed the review — is exactly the failure this
+hardening pass closes. `human_review_required` (boolean, not null, default
+`false`) is the **sticky gate** the publishing policy actually evaluates. It
+is computed as `priorHumanReviewRequired OR thisAttempt.needsHumanReview` —
+see `evaluateReviewForPublishing` in `src/policies/evaluate-review.ts` — so
+it only ever moves `false -> true`. Once any attempt earns a review a human
+review, no later regeneration can unset it. The migration backfills
+`human_review_required = true` for every existing row where
+`needs_human_review = true`, so already-flagged reviews don't lose their
+flag on deploy.
+
+### `POST /api/reviews/[id]/unapprove`
+
+Reverses an `APPROVED` review back to `PENDING_APPROVAL`, clearing
+`approved_by`/`approved_at`, so it re-enters the human queue for a fresh
+sign-off (`src/app/api/reviews/[id]/unapprove/route.ts`,
+`unapproveReview` in `src/reviews/approval.service.ts`). Body: optional
+`{ actor?: string }`. It is only legal while the review has not yet
+published — the repository's `markUnapproved` conditions its UPDATE on
+`status = 'APPROVED' AND published_at IS NULL` in the same statement, not on
+a status read moments earlier, so a review Phase 6 has already posted to
+Google can never be walked back into the queue as if the reply never went
+out. Records an `UNAPPROVED` audit event (added to `AUDIT_EVENTS` in
+`src/types/review.ts`).
+
+### `ConflictError` / 409 on status conflicts
+
+Every approval-workflow write (`markApproved`, `markRejected`,
+`updateFinalResponse`, `markUnapproved` in
+`src/database/repositories/review.repository.ts`) conditions its `UPDATE` on
+the row still being in an allowed status, in the same statement that makes
+the change — `UPDATE ... WHERE id = $1 AND status IN (...)` — rather than on
+a status the service layer read moments earlier. Two requests racing (a
+double-submitted click, or an approve and a reject landing at the same
+time) can both pass the service layer's application-level pre-check
+(`assertStatus` in `src/reviews/approval.service.ts`), but only the first
+writer's `WHERE` clause matches a row; the second gets zero rows back.
+`throwOnZeroRowsOrError` turns that zero-row result into `ConflictError`
+(`src/utils/errors.ts`), which `toHttpStatus` maps to a `409` response,
+instead of the API silently reporting success for a write that never
+happened.
