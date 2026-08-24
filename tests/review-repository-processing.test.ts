@@ -15,6 +15,7 @@ interface FakeUpdateRecord {
   id?: string;
   statusFilter?: string[];
   publishedAtFilter?: null;
+  replyStateFilter?: string[];
 }
 
 /**
@@ -43,10 +44,12 @@ function createFakeDb() {
             eq(col: string, value: unknown) {
               if (col === "id") record.id = value as string;
               if (col === "status") record.statusFilter = [value as string];
+              if (col === "google_reply_state") record.replyStateFilter = [value as string];
               return builder;
             },
             in(col: string, values: string[]) {
               if (col === "status") record.statusFilter = values;
+              if (col === "google_reply_state") record.replyStateFilter = values;
               return builder;
             },
             is(col: string, value: null) {
@@ -244,7 +247,7 @@ describe("updateFinalResponse", () => {
 });
 
 describe("markUnapproved", () => {
-  it("sets status back to PENDING_APPROVAL, clears approval fields, and scopes the write to APPROVED + published_at IS NULL", async () => {
+  it("sets status back to PENDING_APPROVAL, clears approval fields, and scopes the write to APPROVED + published_at IS NULL + not mid-publish", async () => {
     const { markUnapproved } = await import("@/database/repositories/review.repository");
     await markUnapproved("review-1");
 
@@ -252,6 +255,8 @@ describe("markUnapproved", () => {
     expect(update?.table).toBe("reviews");
     expect(update?.statusFilter).toEqual(["APPROVED"]);
     expect(update?.publishedAtFilter).toBeNull();
+    // PUBLISH_PENDING is excluded: a publish attempt currently holds the row.
+    expect(update?.replyStateFilter).toEqual(["NONE", "EXISTING_REPLY_FOUND", "PUBLISHED", "PUBLISH_FAILED"]);
     expect(update?.payload).toEqual({
       status: "PENDING_APPROVAL",
       approved_by: null,
@@ -265,5 +270,88 @@ describe("markUnapproved", () => {
 
     const { markUnapproved } = await import("@/database/repositories/review.repository");
     await expect(markUnapproved("review-1")).rejects.toThrow(ConflictError);
+  });
+});
+
+describe("claimReviewForPublishing", () => {
+  it("moves google_reply_state to PUBLISH_PENDING, scoped to the allowed statuses, claimable reply states, and published_at IS NULL", async () => {
+    const { claimReviewForPublishing } = await import("@/database/repositories/review.repository");
+    await claimReviewForPublishing("review-1", ["APPROVED", "GENERATED"]);
+
+    const [update] = fakeDb.updates;
+    expect(update?.table).toBe("reviews");
+    expect(update?.statusFilter).toEqual(["APPROVED", "GENERATED"]);
+    expect(update?.publishedAtFilter).toBeNull();
+    expect(update?.replyStateFilter).toEqual(["NONE", "PUBLISH_FAILED"]);
+    expect(update?.payload).toEqual({ google_reply_state: "PUBLISH_PENDING" });
+  });
+
+  it("throws ConflictError when the row is no longer eligible (unapproved, already claimed, or already published)", async () => {
+    const { ConflictError } = await import("@/utils/errors");
+    fakeDb.forceNextUpdateResult({ data: null, error: { code: "PGRST116" } });
+
+    const { claimReviewForPublishing } = await import("@/database/repositories/review.repository");
+    await expect(claimReviewForPublishing("review-1", ["APPROVED", "GENERATED"])).rejects.toThrow(ConflictError);
+  });
+});
+
+describe("markPublished", () => {
+  it("sets status PUBLISHED, stamps final_response/published_at, and only writes over a held PUBLISH_PENDING claim", async () => {
+    const { markPublished } = await import("@/database/repositories/review.repository");
+    await markPublished("review-1", { finalResponse: "Thanks!", publishedAt: "2026-08-20T00:00:00.000Z" });
+
+    const [update] = fakeDb.updates;
+    expect(update?.table).toBe("reviews");
+    expect(update?.replyStateFilter).toEqual(["PUBLISH_PENDING"]);
+    expect(update?.payload).toEqual({
+      status: "PUBLISHED",
+      final_response: "Thanks!",
+      published_at: "2026-08-20T00:00:00.000Z",
+      google_reply_state: "PUBLISHED",
+    });
+  });
+
+  it("throws ConflictError when the row does not currently hold a publish claim", async () => {
+    const { ConflictError } = await import("@/utils/errors");
+    fakeDb.forceNextUpdateResult({ data: null, error: { code: "PGRST116" } });
+
+    const { markPublished } = await import("@/database/repositories/review.repository");
+    await expect(
+      markPublished("review-1", { finalResponse: "Thanks!", publishedAt: "2026-08-20T00:00:00.000Z" }),
+    ).rejects.toThrow(ConflictError);
+  });
+});
+
+describe("markPublishFailed", () => {
+  it("sets google_reply_state PUBLISH_FAILED and records the error, without touching status", async () => {
+    const { markPublishFailed } = await import("@/database/repositories/review.repository");
+    await markPublishFailed("review-1", "Google returned HTTP 503.");
+
+    const [update] = fakeDb.updates;
+    expect(update?.replyStateFilter).toEqual(["PUBLISH_PENDING"]);
+    expect(update?.payload).toEqual({
+      google_reply_state: "PUBLISH_FAILED",
+      last_error: "Google returned HTTP 503.",
+    });
+    expect(update?.payload.status).toBeUndefined();
+  });
+});
+
+describe("markPublishBlockedByExistingReply", () => {
+  it("routes the review back to PENDING_APPROVAL and records what Google actually has", async () => {
+    const { markPublishBlockedByExistingReply } = await import("@/database/repositories/review.repository");
+    await markPublishBlockedByExistingReply("review-1", {
+      existingReply: "Someone already replied to this.",
+      existingReplyUpdateTime: "2026-08-19T00:00:00.000Z",
+    });
+
+    const [update] = fakeDb.updates;
+    expect(update?.replyStateFilter).toEqual(["PUBLISH_PENDING"]);
+    expect(update?.payload).toEqual({
+      status: "PENDING_APPROVAL",
+      google_reply_state: "EXISTING_REPLY_FOUND",
+      existing_google_reply: "Someone already replied to this.",
+      existing_reply_updated_at: "2026-08-19T00:00:00.000Z",
+    });
   });
 });

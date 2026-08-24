@@ -427,7 +427,18 @@ export async function updateFinalResponse(
  * `published_at is null` is checked in the same WHERE clause as the status,
  * so a review that Phase 6 already posted to Google can never be walked
  * back into the queue as if the reply never went out.
+ *
+ * Also excludes `google_reply_state = 'PUBLISH_PENDING'`: that value means a
+ * publish attempt has atomically claimed this row (see
+ * claimReviewForPublishing below) and may be mid-flight to Google right now.
+ * Without this, an unapprove could land in the gap between that claim and the
+ * write that records the outcome — status is still APPROVED and published_at
+ * is still null at that instant — and hand the review back to a human as if
+ * nothing were happening, while a reply might be about to go out (or already
+ * has) underneath them.
  */
+const UNAPPROVABLE_REPLY_STATES: GoogleReplyState[] = ["NONE", "EXISTING_REPLY_FOUND", "PUBLISHED", "PUBLISH_FAILED"];
+
 export async function markUnapproved(reviewId: string): Promise<ReviewRow> {
   const { data, error } = await getDb()
     .from("reviews")
@@ -438,11 +449,134 @@ export async function markUnapproved(reviewId: string): Promise<ReviewRow> {
     })
     .eq("id", reviewId)
     .eq("status", "APPROVED" satisfies ReviewStatus)
+    .in("google_reply_state", UNAPPROVABLE_REPLY_STATES)
     .is("published_at", null)
     .select("*")
     .single<ReviewRow>();
 
   if (error || !data) throwOnZeroRowsOrError("unapprove the review", reviewId, error);
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// Publishing (Phase 6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Atomically claims a review for publishing.
+ *
+ * This is the actual "re-check state right before calling Google" guard —
+ * not a SELECT the caller reasons about afterwards, but a single
+ * UPDATE ... WHERE that only succeeds if the row is *still* eligible at the
+ * exact moment it runs. `google_reply_state` is the lock: moving it to
+ * PUBLISH_PENDING is what stops markUnapproved (see above) or a second,
+ * concurrent publish attempt from proceeding once this one has the row.
+ *
+ * `NONE` and `PUBLISH_FAILED` are both claimable — the latter is what makes a
+ * retry possible after a failed attempt. `PUBLISH_PENDING` deliberately is
+ * not: a review already claimed cannot be claimed twice.
+ *
+ * `status` is left untouched by the claim (still APPROVED or GENERATED,
+ * whichever it was) — publishing failure only ever needs to revert
+ * `google_reply_state`, never has to remember which status to restore.
+ */
+const PUBLISH_CLAIMABLE_REPLY_STATES: GoogleReplyState[] = ["NONE", "PUBLISH_FAILED"];
+
+export async function claimReviewForPublishing(
+  reviewId: string,
+  allowedStatuses: ReviewStatus[],
+): Promise<ReviewRow> {
+  const { data, error } = await getDb()
+    .from("reviews")
+    .update({ google_reply_state: "PUBLISH_PENDING" satisfies GoogleReplyState })
+    .eq("id", reviewId)
+    .in("status", allowedStatuses)
+    .in("google_reply_state", PUBLISH_CLAIMABLE_REPLY_STATES)
+    .is("published_at", null)
+    .select("*")
+    .single<ReviewRow>();
+
+  if (error || !data) throwOnZeroRowsOrError("claim the review for publishing", reviewId, error);
+  return data;
+}
+
+/**
+ * Records a successful publish. Guarded on `google_reply_state =
+ * 'PUBLISH_PENDING'` — only the attempt that holds the claim can complete it.
+ * `finalResponse` is written here (not just read) because the automatic
+ * low-risk path (GENERATED) never went through `markApproved`, so
+ * `final_response` may still be null; this is the first point at which "what
+ * was actually published" needs to exist as a fact independent of
+ * `ai_response`.
+ */
+export async function markPublished(
+  reviewId: string,
+  update: { finalResponse: string; publishedAt: string },
+): Promise<ReviewRow> {
+  const { data, error } = await getDb()
+    .from("reviews")
+    .update({
+      status: "PUBLISHED" satisfies ReviewStatus,
+      final_response: update.finalResponse,
+      published_at: update.publishedAt,
+      google_reply_state: "PUBLISHED" satisfies GoogleReplyState,
+    })
+    .eq("id", reviewId)
+    .eq("google_reply_state", "PUBLISH_PENDING" satisfies GoogleReplyState)
+    .select("*")
+    .single<ReviewRow>();
+
+  if (error || !data) throwOnZeroRowsOrError("mark the review published", reviewId, error);
+  return data;
+}
+
+/**
+ * Records a failed publish attempt. `status` is deliberately left alone —
+ * the review stays APPROVED or GENERATED, exactly where it was before the
+ * claim, so it remains eligible for a later retry through the normal
+ * publishReview entrypoint rather than needing a separate "un-fail" action.
+ */
+export async function markPublishFailed(reviewId: string, lastError: string): Promise<ReviewRow> {
+  const { data, error } = await getDb()
+    .from("reviews")
+    .update({
+      google_reply_state: "PUBLISH_FAILED" satisfies GoogleReplyState,
+      last_error: lastError.slice(0, 2000),
+    })
+    .eq("id", reviewId)
+    .eq("google_reply_state", "PUBLISH_PENDING" satisfies GoogleReplyState)
+    .select("*")
+    .single<ReviewRow>();
+
+  if (error || !data) throwOnZeroRowsOrError("mark the review publish-failed", reviewId, error);
+  return data;
+}
+
+/**
+ * Records that Google already has a reply this application did not just
+ * write — discovered live, immediately before what would have been the
+ * publish call. Routes back to PENDING_APPROVAL rather than leaving the
+ * review APPROVED/GENERATED, because whatever made it eligible (a human
+ * approval, or the auto-publish policy) was decided without knowing this.
+ */
+export async function markPublishBlockedByExistingReply(
+  reviewId: string,
+  update: { existingReply: string; existingReplyUpdateTime: string | null },
+): Promise<ReviewRow> {
+  const { data, error } = await getDb()
+    .from("reviews")
+    .update({
+      status: "PENDING_APPROVAL" satisfies ReviewStatus,
+      google_reply_state: "EXISTING_REPLY_FOUND" satisfies GoogleReplyState,
+      existing_google_reply: update.existingReply,
+      existing_reply_updated_at: update.existingReplyUpdateTime,
+    })
+    .eq("id", reviewId)
+    .eq("google_reply_state", "PUBLISH_PENDING" satisfies GoogleReplyState)
+    .select("*")
+    .single<ReviewRow>();
+
+  if (error || !data) throwOnZeroRowsOrError("mark the review blocked on an existing reply", reviewId, error);
   return data;
 }
 

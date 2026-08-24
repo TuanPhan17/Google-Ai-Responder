@@ -4,14 +4,20 @@ Receives Google Business Profile reviews, generates a personalized reply, and
 either publishes it or routes it to a human — with the publish/hold decision
 made by deterministic application code, never by the model.
 
-**Status: Phase 4 complete.** Foundation, Google OAuth, account/location/review
+**Status: Phase 6 complete.** Foundation, Google OAuth, account/location/review
 retrieval, mock fixtures, a reusable AI review-response service with
 structured-output validation, the deterministic risk classification +
-publishing-policy service, and the processing pipeline that drives a stored
+publishing-policy service, the processing pipeline that drives a stored
 review from `RECEIVED` through generation to `GENERATED`/`PENDING_APPROVAL`/
-`FAILED` — with AI output persisted, every step audited, and a fourth
-idempotency layer so a review is never regenerated once it has one. No
-approval UI yet (Phase 5) and no writes to Google yet (Phase 6).
+`FAILED`, the human approval workflow (approve, edit, regenerate, reject,
+unapprove), and publishing an approved or auto-publish-eligible review's
+response to Google (`POST /api/reviews/[id]/publish`) — with an atomic,
+race-proof eligibility check right before every Google write, a live
+existing-reply check that never overwrites a reply this app didn't just
+write, and idempotent recovery if Google accepts a reply but the database
+write recording it fails. See `docs/SPEC.md`'s "Phase 6" section for the
+detailed design. No Pub/Sub-triggered automatic processing yet, and no
+dashboard UI yet (Phases 7 and 8).
 
 ---
 
@@ -36,7 +42,7 @@ route to a human, regardless of what the model says.
 | `src/config` | Zod-validated env, Google endpoint constants |
 | `src/auth` | OAuth flow, token encryption, access-token refresh, admin session |
 | `src/google` | The single authorized HTTP path + accounts/locations/reviews |
-| `src/reviews` | Mapper, idempotent ingest, generation/processing pipeline, sync orchestration, source seam |
+| `src/reviews` | Mapper, idempotent ingest, generation/processing pipeline, approval workflow, publishing, sync orchestration, source seam |
 | `src/openai` | The single authorized HTTP path to OpenAI + review-response service + prompt |
 | `src/policies` | Deterministic risk classification + the publishing-policy service |
 | `src/database` | Supabase client and repositories |

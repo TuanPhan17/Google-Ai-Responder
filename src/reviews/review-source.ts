@@ -3,7 +3,7 @@ import type { GoogleReview } from "@/schemas/google";
 import type { AccountSummary, LocationSummary } from "@/types/review";
 import { listAccounts } from "@/google/accounts.service";
 import { listLocations } from "@/google/locations.service";
-import { getReview, listReviews } from "@/google/reviews.service";
+import { getReview, listReviews, updateReply, type ReviewReply } from "@/google/reviews.service";
 import {
   MOCK_ACCOUNT_ID,
   MOCK_LOCATION_ID,
@@ -31,6 +31,8 @@ export interface ReviewSource {
   listLocations(accountResourceName: string): Promise<LocationSummary[]>;
   listReviews(accountId: string, locationId: string): Promise<GoogleReview[]>;
   getReview(accountId: string, locationId: string, reviewId: string): Promise<GoogleReview>;
+  /** Posts the business reply. Idempotent — see google/reviews.service.ts. */
+  updateReply(accountId: string, locationId: string, reviewId: string, comment: string): Promise<ReviewReply>;
 }
 
 const googleSource: ReviewSource = {
@@ -39,7 +41,28 @@ const googleSource: ReviewSource = {
   listLocations,
   listReviews: async (accountId, locationId) => (await listReviews(accountId, locationId)).reviews,
   getReview,
+  updateReply,
 };
+
+/**
+ * In-memory reply overrides for mock mode, keyed by reviewId. Fixtures are
+ * static, so `mockSource.getReview` layers any reply written through
+ * `mockSource.updateReply` on top of the fixture's own `reviewReply` (which
+ * is how the "already-replied" fixture proves the existing-reply check works
+ * even without Google). Lives for the process's lifetime only — there is
+ * nothing to reset between real requests, only between test runs, and tests
+ * exercise this through a mocked ReviewSource rather than this module.
+ */
+const mockReplyOverrides = new Map<string, ReviewReply>();
+
+function mockReviewWithOverride(reviewId: string): GoogleReview {
+  const fixture = MOCK_FIXTURES.find((item) => item.review.reviewId === reviewId);
+  if (!fixture) throw new Error(`No mock fixture with reviewId "${reviewId}".`);
+
+  const override = mockReplyOverrides.get(reviewId);
+  if (!override) return fixture.review;
+  return { ...fixture.review, reviewReply: { comment: override.comment, updateTime: override.updateTime ?? undefined } };
+}
 
 const mockSource: ReviewSource = {
   kind: "mock",
@@ -69,10 +92,15 @@ const mockSource: ReviewSource = {
 
   listReviews: async () => fixturesAsListResponse(),
 
-  getReview: async (_accountId, _locationId, reviewId) => {
-    const fixture = MOCK_FIXTURES.find((item) => item.review.reviewId === reviewId);
-    if (!fixture) throw new Error(`No mock fixture with reviewId "${reviewId}".`);
-    return fixture.review;
+  getReview: async (_accountId, _locationId, reviewId) => mockReviewWithOverride(reviewId),
+
+  updateReply: async (_accountId, _locationId, reviewId, comment) => {
+    if (!MOCK_FIXTURES.some((item) => item.review.reviewId === reviewId)) {
+      throw new Error(`No mock fixture with reviewId "${reviewId}".`);
+    }
+    const reply: ReviewReply = { comment, updateTime: new Date().toISOString() };
+    mockReplyOverrides.set(reviewId, reply);
+    return reply;
   },
 };
 

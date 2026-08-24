@@ -951,6 +951,23 @@ Implement:
 * duplicate message protection
 * automatic processing workflow
 
+### Known gaps this phase must close
+
+* **Stuck `PUBLISH_PENDING` rows.** `publishReview`
+  (`src/reviews/publishing.service.ts`, Phase 6) claims a review by moving
+  `google_reply_state` to `PUBLISH_PENDING`, calls Google's `updateReply`,
+  then writes `published_at`. If the process dies outright — not a thrown
+  error, the whole runtime disappearing — in the window between Google's
+  response and the `catch` block that would otherwise demote the row back to
+  `PUBLISH_FAILED`, the row is left stuck at `PUBLISH_PENDING`. That state is
+  deliberately not self-claimable (only `NONE`/`PUBLISH_FAILED` are), so an
+  ordinary retry through `publishReview` can't reach it. Closing this needs a
+  background sweep — find `PUBLISH_PENDING` rows older than some threshold,
+  re-check Google's actual reply the same way `publishReview`'s recovery path
+  already does, and force-reclaim them — which belongs here, since Phase 7 is
+  the first phase that gives this application any always-running background
+  process at all.
+
 ## Phase 8 — Dashboard and Configuration
 
 Complete:
@@ -1055,7 +1072,7 @@ When making an architectural decision, briefly explain why you chose it.
 
 # Current state
 
-Phases 1 through 5 are complete and verified. Do not rebuild any of them.
+Phases 1 through 6 are complete and verified. Do not rebuild any of them.
 
 * **Phase 1** — project structure, environment configuration, Supabase
   schema, Google OAuth, token storage, account and location retrieval,
@@ -1068,6 +1085,8 @@ Phases 1 through 5 are complete and verified. Do not rebuild any of them.
   and audit logging.
 * **Phase 5** — the approval workflow (approve, edit, regenerate, reject),
   plus a hardening pass on top of it, detailed below.
+* **Phase 6** — publishing to Google (`src/reviews/publishing.service.ts`,
+  `POST /api/reviews/[id]/publish`), detailed below.
 
 Implement only the phase you are explicitly asked for, and stop at the
 phase boundary.
@@ -1132,3 +1151,105 @@ writer's `WHERE` clause matches a row; the second gets zero rows back.
 (`src/utils/errors.ts`), which `toHttpStatus` maps to a `409` response,
 instead of the API silently reporting success for a write that never
 happened.
+
+## Phase 6 — publishing to Google
+
+`publishReview` (`src/reviews/publishing.service.ts`) is the one function
+that writes to a customer-visible Google surface. It accepts a review in
+`APPROVED` status (a human signed off via Phase 5) or `GENERATED` status (the
+deterministic publishing policy already decided `AUTO_PUBLISH` — see
+`src/policies/publishing-policy.ts`); there is no separate "auto-publish"
+code path, only two ways to arrive at the same eligible-to-publish function.
+Exposed as `POST /api/reviews/[id]/publish`, same shape as approve/reject/
+edit/regenerate.
+
+### Re-checking state immediately before calling Google
+
+A review can sit between "eligible" and "actually published" for an
+arbitrary length of time — long enough for a human to unapprove it, or for
+two publish requests to race. `publishReview` never acts on a status it (or
+its caller) read a moment earlier. `claimReviewForPublishing`
+(`src/database/repositories/review.repository.ts`) is a single
+`UPDATE ... WHERE status IN (...) AND google_reply_state IN ('NONE',
+'PUBLISH_FAILED') AND published_at IS NULL` that only succeeds if the row is
+*still* eligible at the instant it runs, atomically, in the same statement —
+the same idiom the Phase 5 hardening pass established for
+`markApproved`/`markRejected`/`markUnapproved`, reused rather than
+reinvented. The claim moves `google_reply_state` to `PUBLISH_PENDING`, which
+is what stops `markUnapproved` from succeeding on a review a publish attempt
+currently holds — `markUnapproved`'s guard was extended to exclude
+`PUBLISH_PENDING` specifically for this (its `status`/`published_at` checks
+alone were not enough, since both are still `APPROVED`/null while a publish
+is in flight). An earlier plain read (`findReviewById`) still happens first,
+but only to produce a friendlier `BadRequestError` on the common non-racy
+case (a review that was simply never approved); the atomic claim is what
+actually decides eligibility, and a race there surfaces as `ConflictError`
+(409), not a silent publish.
+
+### The existing-reply check is live, not from this database
+
+Immediately after claiming a review, `publishReview` asks Google (via
+`ReviewSource.getReview`) what the review's reply actually is *right now*,
+before writing anything. It does not trust `google_reply_state` as already
+recorded here — that can be stale, because `approveReview` (Phase 5) does not
+itself check reply state (only the auto-publish policy does), and because a
+human can reply to a review directly in Google's own UI at any time. If
+Google's live reply exists and differs from what this function intends to
+publish, it is left untouched and the review is routed back to
+`PENDING_APPROVAL` (`markPublishBlockedByExistingReply`) instead of being
+overwritten.
+
+### If Google accepts the reply but the `published_at` write fails
+
+This is not hypothetical: the Supabase write happens *after* the network
+call to Google returns, so a crash or a transient database error in that
+window leaves Google showing a reply the database does not know about.
+
+The recovery relies on a property of Google's v4 reply endpoint
+(`google/reviews.service.ts`): `updateReply` is a `PUT` to a single reply
+resource per review, not a `POST` that appends. Calling it twice with the
+same comment is a no-op the second time, not two replies. So:
+
+1. `publishReview` wraps both the call to Google and the `markPublished`
+   write in one `try`. If `markPublished` is the half that throws, the
+   `catch` still runs and moves `google_reply_state` from `PUBLISH_PENDING`
+   to `PUBLISH_FAILED` — `status` is never touched, so the review is
+   immediately eligible for an ordinary retry, not a special "resume" path.
+2. That retry re-claims the row and, before writing anything, reads Google's
+   *actual* current reply.
+3. If it already equals the response this function intended to publish, that
+   is proof the earlier attempt's write to Google succeeded — `publishReview`
+   records `published_at` and returns (`{ outcome: "published", recovered:
+   true }`) without calling Google again. Otherwise, the earlier call is
+   treated as never having happened and this function posts normally.
+
+What this does **not** cover: if the process dies entirely — not a thrown
+error, the whole runtime disappearing — between Google accepting the write
+and the `catch` block running, the row is left stuck at `PUBLISH_PENDING`,
+which is deliberately not itself claimable (only `NONE`/`PUBLISH_FAILED`
+are), so the retry path above can't reach it on its own. Phase 6 does not add
+a background sweep for that narrow window; a job that finds stale
+`PUBLISH_PENDING` rows and force-reclaims them belongs with Phase 7's
+"automatic processing workflow," which is the first place this codebase
+gains any always-running background process at all.
+
+### What Phase 6 deliberately does not do
+
+Nothing here calls `publishReview` automatically when a review becomes
+`GENERATED`. `src/reviews/processing.service.ts` (Phase 4, already verified)
+is untouched, and there is still no code path anywhere that triggers
+`processReview` on its own — reviews are processed by an explicit call today,
+same as before this phase. Phase 6's job was to make publishing itself safe;
+wiring a trigger that calls it automatically is explicitly Phase 7's
+"automatic processing workflow." A `GENERATED` review is fully eligible to
+publish the moment something calls `publishReview` for it — including a
+human clicking a "publish now" action, or a script — it simply isn't called
+for them yet without a human or a script doing so.
+
+Live verification: `npx tsx scripts/verify-phase6-live.ts` (same shape as
+`verify-phase5-live.ts`) exercises `POST /api/reviews/[id]/publish` against a
+real Supabase database and a running dev server in `MOCK_MODE`, including the
+concurrent-request race (one 200, one 409) and the existing-reply block,
+using the mock fixtures' real review IDs so the mock `ReviewSource` resolves
+against real fixture data (including `rev-012`, the one fixture that already
+carries a reply).

@@ -1,6 +1,11 @@
 import { GOOGLE_MAX_PAGE_SIZE, LEGACY_MY_BUSINESS_BASE } from "@/config/google-api";
 import { googleRequest, paginate } from "@/google/client";
-import { googleReviewSchema, listReviewsResponseSchema, type GoogleReview } from "@/schemas/google";
+import {
+  googleReviewReplySchema,
+  googleReviewSchema,
+  listReviewsResponseSchema,
+  type GoogleReview,
+} from "@/schemas/google";
 
 /**
  * Reviews API — https://mybusiness.googleapis.com/v4
@@ -14,9 +19,13 @@ import { googleReviewSchema, listReviewsResponseSchema, type GoogleReview } from
  * Note this differs from the Business Information API, which addresses
  * locations as `locations/{locationId}` with no account segment.
  *
- * Phase 1 is read-only. `updateReply` lands in Phase 6, behind the publishing
- * policy — deliberately not here, so no code path in this phase can write to a
- * customer-visible surface.
+ * `updateReply` (Phase 6) is a PUT to a single reply resource per review, not
+ * a POST that appends — Google models "the business's reply" as one slot per
+ * review, addressable at .../reviews/{reviewId}/reply. Calling it twice with
+ * the same comment produces the same end state, not two replies. That
+ * idempotency is what src/reviews/publishing.service.ts leans on to recover
+ * safely from an ambiguous failure (Google accepted the write, but the
+ * process never found out).
  */
 
 export function buildReviewParent(accountId: string, locationId: string): string {
@@ -79,4 +88,37 @@ export async function getReview(
     },
     googleReviewSchema,
   );
+}
+
+export interface ReviewReply {
+  comment: string;
+  updateTime: string | null;
+}
+
+/**
+ * Posts (or replaces) the business's reply to a review — the one write this
+ * application performs against a customer-visible Google surface.
+ *
+ * Goes through the same `googleRequest` path as every read: authenticated,
+ * retried on 429/5xx with backoff, and 401-refreshed once. Retrying this
+ * specific call is safe because of the PUT semantics described above — a
+ * retried write after a network timeout can, at worst, set the same content
+ * twice, never create a duplicate reply.
+ */
+export async function updateReply(
+  accountId: string,
+  locationId: string,
+  reviewId: string,
+  comment: string,
+): Promise<ReviewReply> {
+  const result = await googleRequest(
+    {
+      url: `${LEGACY_MY_BUSINESS_BASE}/${buildReviewParent(accountId, locationId)}/reviews/${reviewId}/reply`,
+      method: "PUT",
+      body: { comment },
+      label: "reviews.updateReply",
+    },
+    googleReviewReplySchema,
+  );
+  return { comment: result.comment, updateTime: result.updateTime ?? null };
 }
