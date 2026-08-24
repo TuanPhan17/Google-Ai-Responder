@@ -1,5 +1,5 @@
-import { getDb } from "@/database/supabase";
-import { DatabaseError } from "@/utils/errors";
+import { getDb, PG_NO_ROWS } from "@/database/supabase";
+import { ConflictError, DatabaseError } from "@/utils/errors";
 import type {
   AccountSummary,
   AuditEvent,
@@ -44,6 +44,7 @@ export interface ReviewRow {
   sentiment: Sentiment | null;
   risk_level: RiskLevel | null;
   needs_human_review: boolean | null;
+  human_review_required: boolean;
   ai_reason: string | null;
   referenced_details: string[];
   ai_model: string | null;
@@ -285,6 +286,8 @@ export interface GeneratedResponseUpdate {
   sentiment: Sentiment;
   riskLevel: RiskLevel;
   needsHumanReview: boolean;
+  /** The sticky, cross-regeneration gate — see evaluate-review.ts. */
+  humanReviewRequired: boolean;
   aiReason: string;
   referencedDetails: string[];
   aiModel: string;
@@ -303,6 +306,7 @@ export async function saveGeneratedResponse(reviewId: string, update: GeneratedR
       sentiment: update.sentiment,
       risk_level: update.riskLevel,
       needs_human_review: update.needsHumanReview,
+      human_review_required: update.humanReviewRequired,
       ai_reason: update.aiReason,
       referenced_details: update.referencedDetails,
       ai_model: update.aiModel,
@@ -337,6 +341,25 @@ export async function markProcessingFailed(reviewId: string, lastError: string):
 // ---------------------------------------------------------------------------
 
 /**
+ * Every approval-workflow write below conditions its UPDATE on the review
+ * still being in an allowed status, in the same statement that makes the
+ * change — not on a status read moments earlier by the caller. Two requests
+ * racing (a double-submitted click, or an approve and a reject landing at
+ * the same time) can otherwise both pass an application-level pre-check and
+ * both write, silently. Here, only the first writer's WHERE clause matches;
+ * the second gets zero rows back and this throws ConflictError instead of
+ * pretending the write happened.
+ */
+function throwOnZeroRowsOrError(action: string, reviewId: string, error: { code?: string } | null): never {
+  if (error?.code === PG_NO_ROWS) {
+    throw new ConflictError(`Cannot ${action}: the review's status changed before this could be applied.`, {
+      reviewId,
+    });
+  }
+  throw new DatabaseError(`Could not ${action}.`, { reviewId }, error);
+}
+
+/**
  * Marks a review approved. `finalResponse` is decided by the service layer —
  * the AI draft if untouched, or whatever a human last edited it to — never
  * computed here, so this function has no opinion about which one wins.
@@ -344,6 +367,7 @@ export async function markProcessingFailed(reviewId: string, lastError: string):
 export async function markApproved(
   reviewId: string,
   update: { finalResponse: string; approvedBy: string },
+  allowedStatuses: ReviewStatus[],
 ): Promise<ReviewRow> {
   const { data, error } = await getDb()
     .from("reviews")
@@ -354,22 +378,24 @@ export async function markApproved(
       approved_at: new Date().toISOString(),
     })
     .eq("id", reviewId)
+    .in("status", allowedStatuses)
     .select("*")
     .single<ReviewRow>();
 
-  if (error || !data) throw new DatabaseError("Could not approve the review.", { reviewId }, error);
+  if (error || !data) throwOnZeroRowsOrError("approve the review", reviewId, error);
   return data;
 }
 
-export async function markRejected(reviewId: string): Promise<ReviewRow> {
+export async function markRejected(reviewId: string, allowedStatuses: ReviewStatus[]): Promise<ReviewRow> {
   const { data, error } = await getDb()
     .from("reviews")
     .update({ status: "REJECTED" satisfies ReviewStatus })
     .eq("id", reviewId)
+    .in("status", allowedStatuses)
     .select("*")
     .single<ReviewRow>();
 
-  if (error || !data) throw new DatabaseError("Could not reject the review.", { reviewId }, error);
+  if (error || !data) throwOnZeroRowsOrError("reject the review", reviewId, error);
   return data;
 }
 
@@ -379,15 +405,44 @@ export async function markRejected(reviewId: string): Promise<ReviewRow> {
  * explicit approval after a human has touched the text, rather than letting
  * Phase 6 auto-publish an edit the deterministic policy never evaluated.
  */
-export async function updateFinalResponse(reviewId: string, finalResponse: string): Promise<ReviewRow> {
+export async function updateFinalResponse(
+  reviewId: string,
+  finalResponse: string,
+  allowedStatuses: ReviewStatus[],
+): Promise<ReviewRow> {
   const { data, error } = await getDb()
     .from("reviews")
     .update({ final_response: finalResponse, status: "PENDING_APPROVAL" satisfies ReviewStatus })
     .eq("id", reviewId)
+    .in("status", allowedStatuses)
     .select("*")
     .single<ReviewRow>();
 
-  if (error || !data) throw new DatabaseError("Could not save the edited response.", { reviewId }, error);
+  if (error || !data) throwOnZeroRowsOrError("save the edited response", reviewId, error);
+  return data;
+}
+
+/**
+ * Reverses an approval. Only legal while the review hasn't published yet —
+ * `published_at is null` is checked in the same WHERE clause as the status,
+ * so a review that Phase 6 already posted to Google can never be walked
+ * back into the queue as if the reply never went out.
+ */
+export async function markUnapproved(reviewId: string): Promise<ReviewRow> {
+  const { data, error } = await getDb()
+    .from("reviews")
+    .update({
+      status: "PENDING_APPROVAL" satisfies ReviewStatus,
+      approved_by: null,
+      approved_at: null,
+    })
+    .eq("id", reviewId)
+    .eq("status", "APPROVED" satisfies ReviewStatus)
+    .is("published_at", null)
+    .select("*")
+    .single<ReviewRow>();
+
+  if (error || !data) throwOnZeroRowsOrError("unapprove the review", reviewId, error);
   return data;
 }
 

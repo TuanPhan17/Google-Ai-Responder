@@ -19,11 +19,24 @@ export interface EvaluateReviewInput {
   /** Only the two fields the policy is allowed to see from the model's output. */
   aiOutput: { riskLevel: RiskLevel; needsHumanReview: boolean };
   settings?: PublishingSettings | null;
+  /**
+   * The review's stored `human_review_required` going into this evaluation.
+   * A regenerate can hand the model a second chance to score a review lower
+   * risk than it did the first time — that's expected, the model isn't
+   * deterministic. What must not happen is that improved second opinion
+   * silently erasing a human-review requirement a prior attempt already
+   * earned. OR'd into this attempt's own signal, never the other way: the
+   * flag can only turn on, never off, across generations of the same review.
+   */
+  priorHumanReviewRequired?: boolean;
 }
 
 export interface EvaluateReviewResult {
   riskLevel: RiskLevel;
+  /** This attempt's own signal only — the informational, per-generation value. */
   needsHumanReview: boolean;
+  /** Sticky across regenerations: priorHumanReviewRequired OR this attempt's needsHumanReview. What the publishing decision actually gates on. */
+  humanReviewRequired: boolean;
   keywordMatches: KeywordRiskMatch[];
   decision: PublishDecision;
   reasons: string[];
@@ -36,10 +49,12 @@ export function evaluateReviewForPublishing(input: EvaluateReviewInput): Evaluat
     aiNeedsHumanReview: input.aiOutput.needsHumanReview,
   });
 
+  const humanReviewRequired = (input.priorHumanReviewRequired ?? false) || classification.needsHumanReview;
+
   const policy = decidePublishing({
     rating: input.rating,
     riskLevel: classification.riskLevel,
-    needsHumanReview: classification.needsHumanReview,
+    needsHumanReview: humanReviewRequired,
     hasExistingGoogleReply: input.hasExistingGoogleReply,
     settings: input.settings,
   });
@@ -47,6 +62,7 @@ export function evaluateReviewForPublishing(input: EvaluateReviewInput): Evaluat
   return {
     riskLevel: classification.riskLevel,
     needsHumanReview: classification.needsHumanReview,
+    humanReviewRequired,
     keywordMatches: classification.keywordMatches,
     decision: policy.decision,
     reasons: policy.reasons,

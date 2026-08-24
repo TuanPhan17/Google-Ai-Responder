@@ -106,6 +106,7 @@ export async function runReviewGeneration(
       hasExistingGoogleReply: processing.google_reply_state !== "NONE",
       aiOutput: { riskLevel: aiOutput.riskLevel, needsHumanReview: aiOutput.needsHumanReview },
       settings,
+      priorHumanReviewRequired: review.human_review_required,
     });
 
     const status: ReviewStatus = evaluation.decision === "AUTO_PUBLISH" ? "GENERATED" : "PENDING_APPROVAL";
@@ -115,6 +116,7 @@ export async function runReviewGeneration(
       sentiment: aiOutput.sentiment,
       riskLevel: evaluation.riskLevel,
       needsHumanReview: evaluation.needsHumanReview,
+      humanReviewRequired: evaluation.humanReviewRequired,
       aiReason: aiOutput.reason,
       referencedDetails: aiOutput.referencedDetails,
       aiModel: getEnv().OPENAI_MODEL,

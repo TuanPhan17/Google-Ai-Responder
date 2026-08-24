@@ -2,6 +2,7 @@ import {
   findReviewById,
   markApproved,
   markRejected,
+  markUnapproved,
   recordEvent,
   updateFinalResponse,
   type ReviewRow,
@@ -15,17 +16,23 @@ import type { BusinessContext, PublishingSettings } from "@/types/business";
 const log = logger.child("reviews.approval");
 
 /**
- * The pending-approval workflow: approve, edit, regenerate, reject — per
- * docs/SPEC.md Phase 5.
+ * The pending-approval workflow: approve, edit, regenerate, reject,
+ * unapprove — per docs/SPEC.md Phase 5.
  *
  * None of these actions publish anything to Google; that is Phase 6. What
  * they do is move a review through its human-review lifecycle and leave a
  * complete audit trail behind (CLAUDE.md safety invariant: the model never has
  * final authority, and every safety-relevant action needs a test proving it).
  *
- * Each action is guarded by an explicit status allowlist rather than a single
- * "not terminal" check, so it's legible at a glance which states a given
- * action can start from.
+ * Each action is guarded by an explicit status allowlist, so it's legible at
+ * a glance which states a given action can start from. For approve, reject,
+ * and edit, that allowlist is enforced twice: here, for a fast, readable
+ * error on the common case, and again inside the repository's UPDATE ...
+ * WHERE clause, which is the one that's actually race-proof — see
+ * throwOnZeroRowsOrError in review.repository.ts. Two concurrent requests
+ * for the same review can both pass this pre-check; only one can win the
+ * atomic write, and the loser gets ConflictError (409), not a silently
+ * clobbered row.
  */
 
 const APPROVABLE_STATUSES: ReviewStatus[] = ["GENERATED", "PENDING_APPROVAL"];
@@ -74,7 +81,7 @@ export async function approveReview(
     throw new BadRequestError("This review has no generated response to approve yet.", { reviewId });
   }
 
-  const updated = await markApproved(reviewId, { finalResponse, approvedBy: actor });
+  const updated = await markApproved(reviewId, { finalResponse, approvedBy: actor }, APPROVABLE_STATUSES);
   await recordEvent(
     reviewId,
     "APPROVED",
@@ -100,7 +107,7 @@ export async function rejectReview(
   const review = requireReview(await findReviewById(reviewId), reviewId);
   assertStatus(review, REJECTABLE_STATUSES, "reject");
 
-  const updated = await markRejected(reviewId);
+  const updated = await markRejected(reviewId, REJECTABLE_STATUSES);
   await recordEvent(reviewId, "REJECTED", { previousStatus: review.status, reason: options.reason ?? null }, actor);
 
   log.info("Review rejected", { reviewId, actor });
@@ -141,7 +148,7 @@ export async function editReviewResponse(
     });
   }
 
-  const updated = await updateFinalResponse(reviewId, trimmed);
+  const updated = await updateFinalResponse(reviewId, trimmed, EDITABLE_STATUSES);
   await recordEvent(
     reviewId,
     "RESPONSE_EDITED_BY_HUMAN",
@@ -184,4 +191,30 @@ export async function regenerateReviewResponse(
   const outcome = await runReviewGeneration(review, { actor, business, settings });
   log.info("Review response regenerated", { reviewId, actor });
   return outcome;
+}
+
+export interface UnapproveReviewResult {
+  review: ReviewRow;
+}
+
+/**
+ * Reverses an approval that hasn't been published yet, sending the review
+ * back to the human queue for a fresh sign-off. Only legal while
+ * published_at is still null — that check runs inside markUnapproved's
+ * WHERE clause, not here, since "has this already gone out to Google" is
+ * exactly the kind of state that can change between a read and a write.
+ */
+export async function unapproveReview(
+  reviewId: string,
+  options: { actor?: string } = {},
+): Promise<UnapproveReviewResult> {
+  const actor = options.actor ?? "admin";
+
+  requireReview(await findReviewById(reviewId), reviewId);
+
+  const updated = await markUnapproved(reviewId);
+  await recordEvent(reviewId, "UNAPPROVED", {}, actor);
+
+  log.info("Review unapproved", { reviewId, actor });
+  return { review: updated };
 }

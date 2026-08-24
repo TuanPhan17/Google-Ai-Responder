@@ -115,6 +115,18 @@ export class UnauthorizedError extends AppError {
   }
 }
 
+/**
+ * The row didn't match the caller's expected state by the time the write
+ * landed — someone else's request (or a double-submit of this one) got there
+ * first. Not retryable in the back-off sense: retrying the same request
+ * without re-reading the row will just conflict again.
+ */
+export class ConflictError extends AppError {
+  constructor(message: string, context?: Record<string, unknown>) {
+    super(message, { code: "CONFLICT", retryable: false, context });
+  }
+}
+
 export function isRetryable(error: unknown): boolean {
   if (error instanceof AppError) return error.retryable;
   // Undici surfaces connection resets and DNS failures as TypeError with a cause.
@@ -132,6 +144,7 @@ export function toPublicMessage(error: unknown): string {
 export function toHttpStatus(error: unknown): number {
   if (error instanceof UnauthorizedError) return 401;
   if (error instanceof BadRequestError) return 400;
+  if (error instanceof ConflictError) return 409;
   if (error instanceof GoogleAuthError) return 409;
   if (error instanceof GoogleApiError) return error.status >= 500 ? 502 : error.status;
   if (error instanceof OpenAiApiError) return error.status >= 500 ? 502 : error.status;

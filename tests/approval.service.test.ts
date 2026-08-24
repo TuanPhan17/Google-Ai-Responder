@@ -2,12 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { randomBytes } from "node:crypto";
 
 import { resetEnvCache } from "@/config/env";
-import { BadRequestError } from "@/utils/errors";
+import { BadRequestError, ConflictError } from "@/utils/errors";
 import type { ReviewRow } from "@/database/repositories/review.repository";
 
 const findReviewById = vi.fn();
 const markApproved = vi.fn();
 const markRejected = vi.fn();
+const markUnapproved = vi.fn();
 const updateFinalResponse = vi.fn();
 const markProcessing = vi.fn();
 const saveGeneratedResponse = vi.fn();
@@ -18,6 +19,7 @@ vi.mock("@/database/repositories/review.repository", () => ({
   findReviewById: (...args: unknown[]) => findReviewById(...args),
   markApproved: (...args: unknown[]) => markApproved(...args),
   markRejected: (...args: unknown[]) => markRejected(...args),
+  markUnapproved: (...args: unknown[]) => markUnapproved(...args),
   updateFinalResponse: (...args: unknown[]) => updateFinalResponse(...args),
   markProcessing: (...args: unknown[]) => markProcessing(...args),
   saveGeneratedResponse: (...args: unknown[]) => saveGeneratedResponse(...args),
@@ -56,6 +58,7 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     sentiment: "positive",
     risk_level: "low",
     needs_human_review: false,
+    human_review_required: false,
     ai_reason: "clean",
     referenced_details: [],
     ai_model: "gpt-4o-mini",
@@ -86,6 +89,7 @@ beforeEach(() => {
   findReviewById.mockReset();
   markApproved.mockReset();
   markRejected.mockReset();
+  markUnapproved.mockReset();
   updateFinalResponse.mockReset();
   markProcessing.mockReset();
   saveGeneratedResponse.mockReset();
@@ -97,6 +101,9 @@ beforeEach(() => {
     reviewRow({ status: "APPROVED", final_response: update.finalResponse, approved_by: update.approvedBy }),
   );
   markRejected.mockImplementation(async () => reviewRow({ status: "REJECTED" }));
+  markUnapproved.mockImplementation(async () =>
+    reviewRow({ status: "PENDING_APPROVAL", approved_by: null, approved_at: null }),
+  );
   updateFinalResponse.mockImplementation(async (_id: string, text: string) =>
     reviewRow({ status: "PENDING_APPROVAL", final_response: text }),
   );
@@ -111,10 +118,11 @@ describe("approveReview", () => {
     const { approveReview } = await import("@/reviews/approval.service");
     const result = await approveReview("review-1", { actor: "jane" });
 
-    expect(markApproved).toHaveBeenCalledWith("review-1", {
-      finalResponse: "Thanks so much for the kind words!",
-      approvedBy: "jane",
-    });
+    expect(markApproved).toHaveBeenCalledWith(
+      "review-1",
+      { finalResponse: "Thanks so much for the kind words!", approvedBy: "jane" },
+      ["GENERATED", "PENDING_APPROVAL"],
+    );
     expect(result.review.status).toBe("APPROVED");
 
     const events = recordEvent.mock.calls.map((call) => [call[1], call[3]]);
@@ -129,10 +137,11 @@ describe("approveReview", () => {
     const { approveReview } = await import("@/reviews/approval.service");
     await approveReview("review-1");
 
-    expect(markApproved).toHaveBeenCalledWith("review-1", {
-      finalResponse: "edited by human",
-      approvedBy: "admin",
-    });
+    expect(markApproved).toHaveBeenCalledWith(
+      "review-1",
+      { finalResponse: "edited by human", approvedBy: "admin" },
+      ["GENERATED", "PENDING_APPROVAL"],
+    );
   });
 
   it("allows approving a GENERATED (auto-publish-eligible) review directly", async () => {
@@ -173,6 +182,14 @@ describe("approveReview", () => {
     const { approveReview } = await import("@/reviews/approval.service");
     await expect(approveReview("missing")).rejects.toThrow(BadRequestError);
   });
+
+  it("surfaces a conflict if the review's status changed underneath a concurrent request", async () => {
+    findReviewById.mockResolvedValue(reviewRow({ status: "PENDING_APPROVAL" }));
+    markApproved.mockRejectedValue(new ConflictError("Cannot approve the review.", { reviewId: "review-1" }));
+
+    const { approveReview } = await import("@/reviews/approval.service");
+    await expect(approveReview("review-1")).rejects.toThrow(ConflictError);
+  });
 });
 
 describe("rejectReview", () => {
@@ -205,6 +222,17 @@ describe("rejectReview", () => {
     await expect(rejectReview("review-1")).rejects.toThrow(BadRequestError);
     expect(markRejected).not.toHaveBeenCalled();
   });
+
+  it("surfaces a conflict if the review's status changed underneath a concurrent request", async () => {
+    // The pre-check here passes (PENDING_APPROVAL is rejectable), but the
+    // repository's atomic UPDATE ... WHERE finds the row no longer matches
+    // by the time it runs — e.g. another request approved it first.
+    findReviewById.mockResolvedValue(reviewRow({ status: "PENDING_APPROVAL" }));
+    markRejected.mockRejectedValue(new ConflictError("Cannot reject the review.", { reviewId: "review-1" }));
+
+    const { rejectReview } = await import("@/reviews/approval.service");
+    await expect(rejectReview("review-1")).rejects.toThrow(ConflictError);
+  });
 });
 
 describe("editReviewResponse", () => {
@@ -214,7 +242,10 @@ describe("editReviewResponse", () => {
     const { editReviewResponse } = await import("@/reviews/approval.service");
     const result = await editReviewResponse("review-1", "  A hand-edited reply.  ", { actor: "jane" });
 
-    expect(updateFinalResponse).toHaveBeenCalledWith("review-1", "A hand-edited reply.");
+    expect(updateFinalResponse).toHaveBeenCalledWith("review-1", "A hand-edited reply.", [
+      "GENERATED",
+      "PENDING_APPROVAL",
+    ]);
     expect(result.review.status).toBe("PENDING_APPROVAL");
     expect(recordEvent).toHaveBeenCalledWith(
       "review-1",
@@ -261,6 +292,16 @@ describe("editReviewResponse", () => {
 
     const { editReviewResponse } = await import("@/reviews/approval.service");
     await expect(editReviewResponse("review-1", "new text")).rejects.toThrow(BadRequestError);
+  });
+
+  it("surfaces a conflict if the review's status changed underneath a concurrent request", async () => {
+    findReviewById.mockResolvedValue(reviewRow({ status: "PENDING_APPROVAL" }));
+    updateFinalResponse.mockRejectedValue(
+      new ConflictError("Could not save the edited response.", { reviewId: "review-1" }),
+    );
+
+    const { editReviewResponse } = await import("@/reviews/approval.service");
+    await expect(editReviewResponse("review-1", "new text")).rejects.toThrow(ConflictError);
   });
 });
 
@@ -347,5 +388,71 @@ describe("regenerateReviewResponse", () => {
 
     const { regenerateReviewResponse } = await import("@/reviews/approval.service");
     await expect(regenerateReviewResponse("review-1")).rejects.toThrow(BadRequestError);
+  });
+
+  it("keeps a review pending after regenerate even when the new AI output is clean, because a prior attempt already flagged it for human review", async () => {
+    // A first generation attempt required human review (e.g. the keyword
+    // scan or the model's own risk call), which stuck human_review_required.
+    // This regenerate call's model output is spotless and the rating/settings
+    // would otherwise auto-publish — human_review_required must still win.
+    const row = reviewRow({
+      status: "PENDING_APPROVAL",
+      rating: 5,
+      risk_level: "high",
+      needs_human_review: true,
+      human_review_required: true,
+      processing_attempts: 1,
+    });
+    findReviewById.mockResolvedValue(row);
+    markProcessing.mockImplementation(async (_id: string, nextAttempt: number) => ({
+      ...row,
+      status: "PROCESSING" as const,
+      processing_attempts: nextAttempt,
+    }));
+    generateReviewResponse.mockResolvedValue(NEW_AI_OUTPUT); // clean: low risk, needsHumanReview false
+
+    const { regenerateReviewResponse } = await import("@/reviews/approval.service");
+    const result = await regenerateReviewResponse("review-1", {
+      settings: { autoPublishFiveStar: true, autoPublishFourStar: true, minAutoPublishRating: 4 },
+    });
+
+    expect(result).toMatchObject({ status: "PENDING_APPROVAL", decision: "REQUIRE_APPROVAL" });
+
+    const [, update] = saveGeneratedResponse.mock.calls[0] as [string, Record<string, unknown>];
+    // This attempt's own signal is reported honestly (clean)...
+    expect(update.needsHumanReview).toBe(false);
+    // ...but the sticky gate the publish decision actually used stays true.
+    expect(update.humanReviewRequired).toBe(true);
+  });
+});
+
+describe("unapproveReview", () => {
+  it("returns an approved review to PENDING_APPROVAL and clears approval fields", async () => {
+    findReviewById.mockResolvedValue(reviewRow({ status: "APPROVED", approved_by: "jane" }));
+
+    const { unapproveReview } = await import("@/reviews/approval.service");
+    const result = await unapproveReview("review-1", { actor: "jane" });
+
+    expect(markUnapproved).toHaveBeenCalledWith("review-1");
+    expect(result.review.status).toBe("PENDING_APPROVAL");
+
+    const events = recordEvent.mock.calls.map((call) => [call[1], call[3]]);
+    expect(events).toEqual([["UNAPPROVED", "jane"]]);
+  });
+
+  it("surfaces a conflict when the review is no longer unapprovable (already published, or not approved)", async () => {
+    findReviewById.mockResolvedValue(reviewRow({ status: "APPROVED" }));
+    markUnapproved.mockRejectedValue(new ConflictError("Could not unapprove the review.", { reviewId: "review-1" }));
+
+    const { unapproveReview } = await import("@/reviews/approval.service");
+    await expect(unapproveReview("review-1")).rejects.toThrow(ConflictError);
+  });
+
+  it("throws when the review does not exist", async () => {
+    findReviewById.mockResolvedValue(null);
+
+    const { unapproveReview } = await import("@/reviews/approval.service");
+    await expect(unapproveReview("missing")).rejects.toThrow(BadRequestError);
+    expect(markUnapproved).not.toHaveBeenCalled();
   });
 });

@@ -60,6 +60,7 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     sentiment: null,
     risk_level: null,
     needs_human_review: null,
+    human_review_required: false,
     ai_reason: null,
     referenced_details: [],
     ai_model: null,

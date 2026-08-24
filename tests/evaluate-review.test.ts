@@ -56,4 +56,42 @@ describe("evaluateReviewForPublishing", () => {
 
     expect(result.decision).toBe("REQUIRE_APPROVAL");
   });
+
+  describe("humanReviewRequired stickiness across regenerations", () => {
+    const CLEAN_INPUT = {
+      rating: 5,
+      reviewText: "Fast, friendly, and fair pricing.",
+      hasExistingGoogleReply: false,
+      aiOutput: { riskLevel: "low" as const, needsHumanReview: false },
+      settings: { autoPublishFiveStar: true, autoPublishFourStar: true, minAutoPublishRating: 4 },
+    };
+
+    it("is false, and does not require approval, on a first attempt with no prior flag and a clean signal", () => {
+      const result = evaluateReviewForPublishing(CLEAN_INPUT);
+
+      expect(result.humanReviewRequired).toBe(false);
+      expect(result.decision).toBe("AUTO_PUBLISH");
+    });
+
+    it("stays true — and keeps requiring approval — even when this attempt's own signal is clean", () => {
+      // Simulates a regenerate: an earlier generation flagged the review
+      // (priorHumanReviewRequired persisted as true), but this attempt's
+      // fresh model call happens to come back spotless.
+      const result = evaluateReviewForPublishing({ ...CLEAN_INPUT, priorHumanReviewRequired: true });
+
+      expect(result.needsHumanReview).toBe(false); // this attempt's own signal, reported honestly
+      expect(result.humanReviewRequired).toBe(true); // the sticky gate stays on
+      expect(result.decision).toBe("REQUIRE_APPROVAL");
+      expect(result.reasons).toContain("needs_human_review");
+    });
+
+    it("turns true and stays true once this attempt's own signal requires it, independent of any prior value", () => {
+      const flaggedInput = { ...CLEAN_INPUT, aiOutput: { riskLevel: "low" as const, needsHumanReview: true } };
+
+      const result = evaluateReviewForPublishing({ ...flaggedInput, priorHumanReviewRequired: false });
+
+      expect(result.humanReviewRequired).toBe(true);
+      expect(result.decision).toBe("REQUIRE_APPROVAL");
+    });
+  });
 });
