@@ -4,7 +4,7 @@ import {
   GOOGLE_OAUTH_TOKEN_URL,
   GOOGLE_SCOPES,
 } from "@/config/google-api";
-import { getGoogleOAuthConfig } from "@/config/env";
+import { getEnv, getGoogleOAuthConfig } from "@/config/env";
 import { googleTokenResponseSchema, type GoogleTokenResponse } from "@/schemas/google";
 import { GoogleApiError, GoogleAuthError, SchemaValidationError } from "@/utils/errors";
 import { withRetry } from "@/utils/retry";
@@ -42,53 +42,73 @@ export function buildAuthorizationUrl(state: string): string {
   return `${GOOGLE_OAUTH_AUTH_URL}?${params.toString()}`;
 }
 
+/**
+ * Bounded the same way `performRequest` (src/google/client.ts) bounds every
+ * other Google-bound fetch: an `AbortController` tied to `GOOGLE_API_TIMEOUT_MS`.
+ * Before this, a hung connection to Google's token endpoint had no timeout at
+ * all — every other Google call in this codebase goes through `googleRequest`,
+ * which enforces one, but the OAuth token exchange/refresh path predates that
+ * and called `fetch` directly. An aborted attempt here is retryable
+ * (`isRetryable` treats `AbortError` as retryable in src/utils/errors.ts), and
+ * both callers already wrap this in `withRetry`, so a timeout now behaves like
+ * any other transient failure instead of hanging the caller indefinitely.
+ */
 async function postToken(body: URLSearchParams, label: string): Promise<GoogleTokenResponse> {
-  const response = await fetch(GOOGLE_OAUTH_TOKEN_URL, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body,
-    cache: "no-store",
-  });
+  const env = getEnv();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), env.GOOGLE_API_TIMEOUT_MS);
 
-  const text = await response.text();
+  try {
+    const response = await fetch(GOOGLE_OAUTH_TOKEN_URL, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body,
+      signal: controller.signal,
+      cache: "no-store",
+    });
 
-  if (!response.ok) {
-    // Google's OAuth errors are a flat {error, error_description}. We surface
-    // the code but never the request body, which contains the client secret.
-    let code = "unknown_error";
-    let description = "";
-    try {
-      const parsed = JSON.parse(text) as { error?: string; error_description?: string };
-      code = parsed.error ?? code;
-      description = parsed.error_description ?? "";
-    } catch {
-      /* non-JSON error body; fall through with the defaults */
+    const text = await response.text();
+
+    if (!response.ok) {
+      // Google's OAuth errors are a flat {error, error_description}. We surface
+      // the code but never the request body, which contains the client secret.
+      let code = "unknown_error";
+      let description = "";
+      try {
+        const parsed = JSON.parse(text) as { error?: string; error_description?: string };
+        code = parsed.error ?? code;
+        description = parsed.error_description ?? "";
+      } catch {
+        /* non-JSON error body; fall through with the defaults */
+      }
+
+      // invalid_grant means the refresh token is dead — revoked, expired after
+      // long disuse, or invalidated by a password change. Retrying cannot help.
+      if (code === "invalid_grant") {
+        throw new GoogleAuthError(
+          "Google rejected the stored credential. Reconnect the Google account.",
+          { label, code },
+        );
+      }
+
+      throw new GoogleApiError(`Google token request failed (${code}).`, {
+        status: response.status,
+        context: { label, code, description: description.slice(0, 200) },
+      });
     }
 
-    // invalid_grant means the refresh token is dead — revoked, expired after
-    // long disuse, or invalidated by a password change. Retrying cannot help.
-    if (code === "invalid_grant") {
-      throw new GoogleAuthError(
-        "Google rejected the stored credential. Reconnect the Google account.",
-        { label, code },
-      );
+    const parsed = googleTokenResponseSchema.safeParse(JSON.parse(text));
+    if (!parsed.success) {
+      throw new SchemaValidationError("Google returned an unexpected token response.", {
+        label,
+        issues: parsed.error.issues.map((issue) => issue.path.join(".")),
+      });
     }
 
-    throw new GoogleApiError(`Google token request failed (${code}).`, {
-      status: response.status,
-      context: { label, code, description: description.slice(0, 200) },
-    });
+    return parsed.data;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  const parsed = googleTokenResponseSchema.safeParse(JSON.parse(text));
-  if (!parsed.success) {
-    throw new SchemaValidationError("Google returned an unexpected token response.", {
-      label,
-      issues: parsed.error.issues.map((issue) => issue.path.join(".")),
-    });
-  }
-
-  return parsed.data;
 }
 
 export interface ExchangedTokens {
@@ -164,12 +184,26 @@ export async function refreshAccessToken(refreshToken: string): Promise<Refreshe
   };
 }
 
+/**
+ * Same `AbortController` / `GOOGLE_API_TIMEOUT_MS` bound as `postToken` above
+ * and `performRequest` in src/google/client.ts — this was the other
+ * Google-bound `fetch` in the codebase with no timeout of its own. A hang
+ * here is lower-severity than in `postToken` (the surrounding `try`/`catch`
+ * already treats any failure as non-fatal and proceeds with local
+ * disconnection), but it would still have left the disconnect request itself
+ * hanging indefinitely rather than completing promptly.
+ */
 export async function revokeToken(token: string): Promise<void> {
+  const env = getEnv();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), env.GOOGLE_API_TIMEOUT_MS);
+
   try {
     await fetch(GOOGLE_OAUTH_REVOKE_URL, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ token }),
+      signal: controller.signal,
       cache: "no-store",
     });
   } catch (error) {
@@ -178,6 +212,8 @@ export async function revokeToken(token: string): Promise<void> {
     log.warn("Token revocation failed; removing the local credential anyway", {
       error: error instanceof Error ? error.message : String(error),
     });
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

@@ -953,20 +953,14 @@ Implement:
 
 ### Known gaps this phase must close
 
-* **Stuck `PUBLISH_PENDING` rows.** `publishReview`
-  (`src/reviews/publishing.service.ts`, Phase 6) claims a review by moving
-  `google_reply_state` to `PUBLISH_PENDING`, calls Google's `updateReply`,
-  then writes `published_at`. If the process dies outright — not a thrown
-  error, the whole runtime disappearing — in the window between Google's
-  response and the `catch` block that would otherwise demote the row back to
-  `PUBLISH_FAILED`, the row is left stuck at `PUBLISH_PENDING`. That state is
-  deliberately not self-claimable (only `NONE`/`PUBLISH_FAILED` are), so an
-  ordinary retry through `publishReview` can't reach it. Closing this needs a
-  background sweep — find `PUBLISH_PENDING` rows older than some threshold,
-  re-check Google's actual reply the same way `publishReview`'s recovery path
-  already does, and force-reclaim them — which belongs here, since Phase 7 is
-  the first phase that gives this application any always-running background
-  process at all.
+* **Stuck `PUBLISH_PENDING` rows.** Closed, code-side — see "Phase 7
+  (code-only pass)" below. `src/reviews/sweep.service.ts` force-reclaims
+  stale `PUBLISH_PENDING` rows and resolves them through the same live-Google
+  recovery path `publishReview` itself uses. Wiring an actual scheduler to
+  call it is still outstanding.
+* Pub/Sub notification handling, the webhook endpoint, and the Google Cloud
+  configuration it needs are still outstanding — deliberately deferred to a
+  separate pass.
 
 ## Phase 8 — Dashboard and Configuration
 
@@ -1253,3 +1247,120 @@ concurrent-request race (one 200, one 409) and the existing-reply block,
 using the mock fixtures' real review IDs so the mock `ReviewSource` resolves
 against real fixture data (including `rev-012`, the one fixture that already
 carries a reply).
+
+## Phase 7 (code-only pass) — background sweep and auto-publish trigger
+
+This pass implements only the two code-side gaps Phase 6 and the "Known
+gaps" note above left open. It deliberately does **not** touch Pub/Sub, the
+notification webhook, or any Google Cloud configuration — those remain a
+separate pass, and there is still no actual scheduler wired up to call any
+of this on a timer.
+
+`src/reviews/sweep.service.ts` adds two independent passes, both callable
+directly or together via `runBackgroundSweep()`:
+
+* **`recoverStalePublishPendingReviews`** — closes the stuck-`PUBLISH_PENDING`
+  gap. Finds rows whose `google_reply_state` has been `PUBLISH_PENDING` for
+  longer than `olderThanMs` (default 5 minutes), force-reclaims each one
+  atomically, and resolves it through `finalizeClaimedPublish` — the exact
+  function `publishReview` (Phase 6) itself calls after its own claim
+  succeeds, extracted from `publishing.service.ts` specifically so the sweep
+  cannot drift from the crash-recovery logic already proven there (live
+  Google check first, recover/publish/block from that).
+
+  *Stuck vs. mid-flight:* a normal claim resolves within one Google HTTP
+  round trip because any ordinary failure already hits `publishReview`'s own
+  `catch` and demotes the row to `PUBLISH_FAILED`. A row still
+  `PUBLISH_PENDING` past the staleness threshold means the process holding
+  the claim died outright, not that it's merely slow — but "one round trip"
+  is not the same as "seconds." `finalizeClaimedPublish` makes up to two
+  sequential `googleRequest` calls (`getReview`, then `updateReply`), and
+  each is individually bounded by `GOOGLE_API_MAX_ATTEMPTS *
+  GOOGLE_API_TIMEOUT_MS` (every attempt is capped at the timeout via
+  `AbortController`, and a timed-out attempt is itself retryable — see
+  `isRetryable` in `src/utils/errors.ts`). At the env schema's defaults
+  (20s × 4 attempts) that's ≈83.5s per call, ≈167s (2.8 min) for both; at the
+  schema-allowed maximum (120s × 8 attempts, both valid operator responses to
+  a slow Business Profile API) it's ≈2023s (33.7 min). A flat threshold that
+  ignores this can misclassify a review that is still legitimately retrying
+  as stuck. This used to be worse than a threshold-tuning problem: a 401
+  mid-retry triggers `forceRefresh()` → `refreshAccessToken()` →
+  `postToken()` in `src/auth/google-oauth.ts`, and `postToken` issued a raw
+  `fetch` with no `AbortController` and no timeout at all — every other
+  Google-bound fetch in this codebase goes through `googleRequest`, which
+  does enforce one, but the OAuth token exchange/refresh path predated that
+  and was never brought in line. A hang there was genuinely unbounded; no
+  finite staleness threshold could have closed that gap. **Fixed**:
+  `postToken` is now wrapped in the same `AbortController` /
+  `GOOGLE_API_TIMEOUT_MS` pattern as `performRequest`
+  (`src/google/client.ts`), so a hung token-endpoint connection now times out
+  and retries like any other transient Google failure instead of hanging the
+  caller forever.
+
+  The default threshold (`defaultStalePublishPendingMs` in
+  `sweep.service.ts`) is derived from that same retry budget, not a flat
+  guess: `GOOGLE_API_MAX_ATTEMPTS * GOOGLE_API_TIMEOUT_MS * 2` (two
+  sequential Google calls) plus a fixed 5-minute safety margin for the
+  backoff sleeps between attempts, the Supabase round trips around the
+  Google calls, and general scheduling jitter — none of which the
+  multiplication alone accounts for. Raising `GOOGLE_API_TIMEOUT_MS` or
+  `GOOGLE_API_MAX_ATTEMPTS` later automatically widens this threshold along
+  with it, instead of silently invalidating a hardcoded number now that the
+  token-refresh path is bounded too. The threshold is still a plain
+  parameter (`findStalePublishPendingReviewIds`,
+  `claimStalePublishPendingReview` in `review.repository.ts`) that a caller
+  can override — `defaultStalePublishPendingMs()` only supplies what
+  `recoverStalePublishPendingReviews` uses when a caller doesn't.
+  `tests/sweep.service.test.ts` — "derives the default staleness threshold
+  from the Google retry budget, not a flat guess" — asserts the formula
+  directly against overridden `GOOGLE_API_TIMEOUT_MS`/`GOOGLE_API_MAX_ATTEMPTS`
+  env values.
+
+  *If the threshold is ever crossed by a genuinely in-flight call anyway* —
+  a misconfigured override, or simply bad luck on timing — the sweep's
+  force-reclaim doesn't stop the original caller: it's a bare `UPDATE` that
+  bumps `updated_at`, not a signal. Both `finalizeClaimedPublish`
+  executions then race to call `markPublished`/`markPublishFailed`. Google's
+  reply endpoint is a PUT, so this can't produce a duplicate reply, but the
+  loser's write no longer matches `WHERE google_reply_state =
+  'PUBLISH_PENDING'` and throws `ConflictError`. `recoverStalePublishPendingReviews`
+  catches that per-row (tallied as `skipped`) specifically so one review
+  losing this race can't abort the rest of the sweep batch. Verified by
+  `tests/sweep.service.test.ts`'s "catches a double-claim race" test, which
+  was confirmed to fail without that `try`/`catch` (a plain uncaught
+  `ConflictError` propagating out of `recoverStalePublishPendingReviews`)
+  before the fix landed.
+
+  *Two sweep runs claiming the same row:* `claimStalePublishPendingReview` is
+  a single `UPDATE ... WHERE google_reply_state = 'PUBLISH_PENDING' AND
+  updated_at < cutoff` — the same atomic-claim idiom `claimReviewForPublishing`
+  (Phase 6) already established. The write sets `google_reply_state` back to
+  the value it already had, which looks like a no-op but isn't: the
+  `reviews_set_updated_at` trigger (`supabase/migrations/0001_init.sql`)
+  fires on any `UPDATE` regardless of which columns changed, so the claim
+  bumps `updated_at` to now. That bump is what a second, concurrent claim
+  attempt's own `updated_at < cutoff` clause fails to match — under
+  Postgres's read-committed semantics, an `UPDATE` re-checks its `WHERE`
+  clause against each row's current values after acquiring that row's lock,
+  so only the first of two racing claims can win. The loser gets zero rows
+  back (`claimStalePublishPendingReview` returns `null`) and is silently
+  skipped — not reported as a `ConflictError`, since a sweep losing this race
+  is the expected case, not a caller-facing failure.
+
+* **`publishEligibleGeneratedReviews`** — closes the auto-trigger gap
+  ("What Phase 6 deliberately does not do," above). Finds `GENERATED`
+  reviews (the deterministic policy already decided `AUTO_PUBLISH`) with no
+  claim on them yet, and calls `publishReview` for each. `publishReview`'s
+  own atomic claim is the real eligibility guard here too — a candidate this
+  function selected that a human or another sweep tick claimed first just
+  loses that race as an ordinary `ConflictError`, tallied as `skipped`
+  without stopping the rest of the batch.
+
+`scripts/run-sweep.ts` (`npm run sweep`) is one tick of `runBackgroundSweep`,
+runnable by hand or by whatever scheduler gets set up later — that wiring
+(a platform's scheduled-function feature, an OS cron entry, a scheduled CI
+workflow) is exactly the infrastructure this pass was told not to set up.
+`tests/sweep.service.test.ts` covers both passes, including the lost-claim-
+race and already-resolved-candidate cases, with the repository and the live
+Google check mocked the same way `tests/publishing.service.test.ts` mocks
+them for `publishReview` itself.

@@ -14,7 +14,8 @@
     "test:watch": "vitest",
     "db:migrate": "tsx scripts/migrate.ts",
     "keys:generate": "tsx scripts/generate-keys.ts",
-    "ai:try-fixture": "tsx scripts/try-fixture-response.ts"
+    "ai:try-fixture": "tsx scripts/try-fixture-response.ts",
+    "sweep": "tsx scripts/run-sweep.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",

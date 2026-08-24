@@ -144,6 +144,26 @@ export async function publishReview(
   // The guard that actually matters — see the module doc comment.
   const claimed = await claimReviewForPublishing(reviewId, PUBLISHABLE_STATUSES);
 
+  return finalizeClaimedPublish(claimed, actor);
+}
+
+/**
+ * Everything that happens once a review is already atomically claimed
+ * (`google_reply_state = 'PUBLISH_PENDING'`) — the live Google check, the
+ * write, and the outcome bookkeeping described in the module doc comment
+ * above.
+ *
+ * Split out so `publishReview`'s own claim (via `claimReviewForPublishing`,
+ * NONE/PUBLISH_FAILED -> PUBLISH_PENDING) and the Phase 7 stale-row sweep's
+ * claim (`claimStalePublishPendingReview`, a PUBLISH_PENDING row whose claim
+ * looks abandoned, re-touched in place) both land here afterwards. The two
+ * callers claim differently — one from a fresh state, one by force-reclaiming
+ * a row already in PUBLISH_PENDING — but once a caller holds the claim, what
+ * happens next (check Google live, recover/publish/block) is identical, and
+ * only living in one place keeps it that way.
+ */
+export async function finalizeClaimedPublish(claimed: ReviewRow, actor: string): Promise<PublishReviewOutcome> {
+  const reviewId = claimed.id;
   const finalResponse = claimed.final_response ?? claimed.ai_response;
   if (!finalResponse) {
     await markPublishFailed(reviewId, "No generated response text was available to publish.");

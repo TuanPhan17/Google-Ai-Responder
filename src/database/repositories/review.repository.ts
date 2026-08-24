@@ -580,6 +580,102 @@ export async function markPublishBlockedByExistingReply(
   return data;
 }
 
+// ---------------------------------------------------------------------------
+// Background sweep (Phase 7)
+// ---------------------------------------------------------------------------
+
+/**
+ * IDs of GENERATED reviews the deterministic publishing policy already
+ * cleared for AUTO_PUBLISH (`src/policies/publishing-policy.ts`), that
+ * nothing has published yet. This is only a candidate list — the actual
+ * eligibility guard is `claimReviewForPublishing`, run per-review by
+ * `publishReview` itself, so a stale or slightly-off candidate here just
+ * costs one wasted claim attempt, never an incorrect publish.
+ */
+export async function findAutoPublishEligibleReviewIds(limit: number): Promise<string[]> {
+  const { data, error } = await getDb()
+    .from("reviews")
+    .select("id")
+    .eq("status", "GENERATED" satisfies ReviewStatus)
+    .in("google_reply_state", PUBLISH_CLAIMABLE_REPLY_STATES)
+    .is("published_at", null)
+    .order("created_at", { ascending: true })
+    .limit(limit)
+    .returns<Array<{ id: string }>>();
+
+  if (error) throw new DatabaseError("Could not list auto-publish-eligible reviews.", {}, error);
+  return (data ?? []).map((row) => row.id);
+}
+
+/**
+ * IDs of PUBLISH_PENDING rows whose claim looks abandoned — last touched
+ * before `olderThanMs` ago. A review claimed by `claimReviewForPublishing`
+ * normally resolves (to PUBLISHED or PUBLISH_FAILED) within one Google HTTP
+ * round trip; still sitting in PUBLISH_PENDING past this threshold means the
+ * process that held the claim died outright rather than merely being slow —
+ * an ordinary error would have hit the `catch` in publishReview and already
+ * demoted the row to PUBLISH_FAILED. This is only a candidate list, same
+ * caveat as above: `claimStalePublishPendingReview` is the real guard.
+ */
+export async function findStalePublishPendingReviewIds(olderThanMs: number, limit: number): Promise<string[]> {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  const { data, error } = await getDb()
+    .from("reviews")
+    .select("id")
+    .eq("google_reply_state", "PUBLISH_PENDING" satisfies GoogleReplyState)
+    .lt("updated_at", cutoff)
+    .order("updated_at", { ascending: true })
+    .limit(limit)
+    .returns<Array<{ id: string }>>();
+
+  if (error) throw new DatabaseError("Could not list stale PUBLISH_PENDING reviews.", {}, error);
+  return (data ?? []).map((row) => row.id);
+}
+
+/**
+ * Atomically force-reclaims one stale PUBLISH_PENDING row for the sweep.
+ *
+ * Same idiom as `claimReviewForPublishing`: a single UPDATE ... WHERE that
+ * only matches if the row is *still* stale — `updated_at` still older than
+ * the cutoff — at the exact instant it runs. The write sets
+ * `google_reply_state` to the value it already had; that's not a no-op,
+ * though, because the `reviews_set_updated_at` trigger fires on any UPDATE
+ * and bumps `updated_at` regardless of which columns actually changed. That
+ * bump is what stops a second sweep tick — or a second sweep process running
+ * concurrently — from claiming the same row: its own `updated_at < cutoff`
+ * clause will no longer match once the first claim has landed. Under
+ * Postgres's read-committed semantics, an UPDATE re-checks its WHERE clause
+ * against each row's current values after acquiring that row's lock, so two
+ * concurrent claims on the same id resolve exactly like two concurrent
+ * `claimReviewForPublishing` calls: only the first to acquire the lock has
+ * its WHERE clause still match; the second re-evaluates against the
+ * now-fresh `updated_at` and gets zero rows.
+ *
+ * Returns `null` — not a thrown `ConflictError` — when the claim doesn't
+ * land. Unlike the interactive publish endpoint, where a lost race is
+ * reported to a caller as a 409, a sweep losing this race is the expected,
+ * silent case: another sweep tick already reclaimed the row, or an ordinary
+ * `publishReview` retry resolved it in the meantime. Neither is a failure
+ * worth surfacing.
+ */
+export async function claimStalePublishPendingReview(
+  reviewId: string,
+  olderThanMs: number,
+): Promise<ReviewRow | null> {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  const { data, error } = await getDb()
+    .from("reviews")
+    .update({ google_reply_state: "PUBLISH_PENDING" satisfies GoogleReplyState })
+    .eq("id", reviewId)
+    .eq("google_reply_state", "PUBLISH_PENDING" satisfies GoogleReplyState)
+    .lt("updated_at", cutoff)
+    .select("*")
+    .maybeSingle<ReviewRow>();
+
+  if (error) throw new DatabaseError("Could not claim the stale review for sweep recovery.", { reviewId }, error);
+  return data;
+}
+
 /** Snapshots the customer's previous text before an edit overwrites it. */
 export async function recordRevision(reviewId: string, row: ReviewRow): Promise<void> {
   const { error } = await getDb().from("review_revisions").insert({
