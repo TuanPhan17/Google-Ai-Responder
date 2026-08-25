@@ -958,9 +958,13 @@ Implement:
   stale `PUBLISH_PENDING` rows and resolves them through the same live-Google
   recovery path `publishReview` itself uses. Wiring an actual scheduler to
   call it is still outstanding.
-* Pub/Sub notification handling, the webhook endpoint, and the Google Cloud
-  configuration it needs are still outstanding — deliberately deferred to a
-  separate pass.
+* **Closed.** Pub/Sub notification handling and the webhook endpoint are
+  implemented — `POST /api/pubsub/reviews`, `src/reviews/pubsub.service.ts`.
+  See "Pub/Sub automation" under Current state, below. The Google Cloud side
+  (creating a topic, an authenticated push subscription, and PATCHing
+  `accounts/{id}/notificationSetting` to point at it) is still a manual step
+  the human has to perform once real Google API access is granted — see
+  README's Pub/Sub setup section.
 
 ## Phase 8 — Dashboard and Configuration
 
@@ -1066,7 +1070,7 @@ When making an architectural decision, briefly explain why you chose it.
 
 # Current state
 
-Phases 1 through 6, the Phase 7 code-only pass, and Phase 8 are complete and
+Phases 1 through 8, including Phase 7's Pub/Sub half, are complete and
 verified. Do not rebuild any of them.
 
 * **Phase 1** — project structure, environment configuration, Supabase
@@ -1082,9 +1086,10 @@ verified. Do not rebuild any of them.
   plus a hardening pass on top of it, detailed below.
 * **Phase 6** — publishing to Google (`src/reviews/publishing.service.ts`,
   `POST /api/reviews/[id]/publish`), detailed below.
-* **Phase 7 (code half)** — background sweep and the auto-publish trigger,
-  detailed below. The Pub/Sub half (notification webhook, Google Cloud
-  config) remains outstanding.
+* **Phase 7** — background sweep, the auto-publish trigger, and now the
+  Pub/Sub notification webhook (`POST /api/pubsub/reviews`), detailed below.
+  The Google Cloud side of Pub/Sub (creating the topic and push subscription)
+  is still a manual, external step — see README.
 * **Phase 8** — the dashboard (New Reviews queue, Published history,
   Settings) and the `business_settings` persistence layer behind it,
   detailed below.
@@ -1395,6 +1400,128 @@ workflow) is exactly the infrastructure this pass was told not to set up.
 race and already-resolved-candidate cases, with the repository and the live
 Google check mocked the same way `tests/publishing.service.test.ts` mocks
 them for `publishReview` itself.
+
+## Pub/Sub automation (the rest of Phase 7)
+
+`POST /api/pubsub/reviews` (`src/app/api/pubsub/reviews/route.ts`) is a Cloud
+Pub/Sub push endpoint. `src/reviews/pubsub.service.ts` holds the actual
+logic; the route is a thin wrapper around it, same split as every other
+route in this codebase.
+
+### Authentication is not the admin session
+
+Every other route in this app is gated by `withAdmin`
+(`src/app/api/_lib/handler.ts`), which checks the admin session cookie. A
+Pub/Sub push request will never carry that cookie, so this route has its own
+gate: `verifyPubSubPushToken` (`src/google/pubsub-auth.ts`) checks the
+Google-signed OIDC JWT Pub/Sub puts in the request's `Authorization: Bearer`
+header (`google-auth-library`'s `OAuth2Client.verifyIdToken`, Google's own
+recommended approach), then additionally requires `email_verified: true` and
+a `.iam.gserviceaccount.com` email — `verifyIdToken` alone checks the
+signature, expiry, and audience, not that the token came from a service
+account at all. `middleware.ts` allowlists `/api/pubsub/` so requests reach
+the route without being redirected to `/login` first; the route's own OIDC
+check is the actual authentication boundary. `PUBSUB_SKIP_VERIFICATION`
+(`src/config/env.ts`, default `false`) bypasses this for local testing only —
+there is no real Pub/Sub service to sign a token in mock mode — and the route
+logs a warning on every request while it's true specifically so it can't be
+left on silently.
+
+### Status codes are Pub/Sub's retry signal, not decoration
+
+Pub/Sub retries a push until it receives a 2xx. The route uses that
+deliberately: a malformed message (bad base64, unparseable JSON, a shape
+`pubSubPushEnvelopeSchema`/`googleNotificationSchema` reject) returns 200 —
+acknowledged and dropped, because retrying garbage forever wastes nothing but
+Pub/Sub's own effort, the same "do not retry permanently invalid requests
+indefinitely" principle this codebase's Google/OpenAI retry logic already
+follows. An auth failure returns 401 — not an ack, since the request wasn't
+legitimately from Pub/Sub. A genuine processing failure (Google's API
+unreachable, the database down) returns 500, letting Pub/Sub's own backoff
+retry the same message later instead of losing it.
+
+### The exact notification JSON shape is not fully documented by Google
+
+Google's Business Profile notification reference (`NotificationSetting`,
+`NotificationType`) confirms the enum values (`NEW_REVIEW`, `UPDATED_REVIEW`,
+`GOOGLE_UPDATE`, etc.) and says a review notification carries a
+`review_name`, but — as of when this was written — never publishes the
+message body's actual JSON schema (checked directly against Google's current
+reference docs, not assumed from memory, per CLAUDE.md's instruction not to
+guess at Google API behavior). `src/schemas/pubsub.ts` reflects that
+honestly: the Pub/Sub envelope itself (`message.data`/`messageId`/
+`publishTime`) is stable, documented infrastructure and is validated
+strictly; the inner notification is validated permissively
+(`.passthrough()`, everything but nothing actually required) rather than
+pretending a level of certainty about Google's exact field names that
+doesn't exist yet.
+
+`handleReviewNotification` (`pubsub.service.ts`) has two paths as a result:
+
+* **Targeted fetch** — the notification's `reviewName` (or `review_name`)
+  parses as `accounts/{a}/locations/{l}/reviews/{r}`, the same resource-name
+  shape this codebase already uses everywhere (`buildReviewParent` in
+  `google/reviews.service.ts`). One `getReview` call, one `ingestReview`
+  call. If the fetch itself throws, the error is deliberately left uncaught
+  so it propagates to the route as a 500 — a transient Google failure on one
+  specific review should retry the whole message, not be silently absorbed.
+* **Fallback resync** — the resource name doesn't parse (missing field, or a
+  shape Google's docs didn't confirm). Every location this app has synced
+  (`listSyncedLocations`, `review.repository.ts`) gets resynced instead of
+  guessing. This is always *correct*, just less targeted:
+  `ingestReview`'s own idempotency (its doc comment enumerates the three
+  layers) makes resyncing an unaffected location's reviews a no-op, not a
+  duplicate. Tightening this path to be as targeted as the first one needs
+  real notification traffic to check field names against — the same external
+  dependency (Google API approval) blocking everything else about running
+  this against real reviews.
+
+Both paths funnel through `ingestAndAutoProcess`, which — unlike the initial
+Google fetch — catches its own failures per review and tallies them rather
+than throwing, matching how `ingestReviews` (`ingest.service.ts`) already
+treats a batch: one bad row shouldn't take the rest of a resync down with it.
+
+### Automatic processing, but only for Pub/Sub
+
+Per Phase 7's "automatic processing workflow": a review that `ingestReview`
+leaves in `RECEIVED` (a genuinely new review, or an edit whose content
+actually changed) is immediately run through `processReview` —
+`resolveLocationConfig` (Phase 8's `settings.service.ts`) supplies real
+business context and publishing settings, the same as the dashboard's manual
+"Generate response" button does. This is deliberately scoped to the Pub/Sub
+path only. The dashboard's own manual "Pull reviews" button (Phase 1,
+unchanged) still only ingests — a human clicking that button hasn't asked
+for every result to also be auto-drafted, and changing that button's
+established behavior wasn't part of this pass. Auto-processing on arrival is
+specifically the automation wiring up notifications is supposed to add.
+
+### Closing a real gap found while building this
+
+Auditing the existing pipeline before wiring the webhook surfaced that
+**nothing in the app called `processReview` at all** before Phase 8 — see
+Phase 8's own "closing a gap" note above (`POST /api/reviews/[id]/process`).
+The Pub/Sub webhook is the second, and more important, caller of that same
+function: it's what makes "automatic processing workflow" actually automatic
+rather than requiring a human to notice a new review and click a button.
+
+### Verifying this locally
+
+There is no real Pub/Sub subscription to test against without live Google
+API access. `scripts/simulate-pubsub-notification.ts`
+(`npm run pubsub:simulate`) POSTs a fake push envelope — shaped exactly like
+Pub/Sub's real one — at a running dev server, using the mock fixtures' real
+account/location/review ids so it resolves against actual mock data. Run
+against a dev server started with `PUBSUB_SKIP_VERIFICATION=true`. It
+exercises, in order: an irrelevant notification type being acknowledged and
+ignored, a targeted fetch creating and auto-processing a new review, the same
+notification delivered again resolving to `unchanged` (duplicate-delivery
+protection, proven the same way `ingestReview`'s own idempotency already is),
+and the fallback resync path. Verified live against a real Supabase database
+and the configured AI provider: a deleted fixture row, reintroduced through
+the webhook, landed in `PENDING_APPROVAL` with a genuine, personalized AI
+draft — not just ingested, but the full automatic pipeline in one shot.
+`tests/pubsub.service.test.ts` and `tests/pubsub-auth.test.ts` cover the
+same logic with mocked dependencies for fast, deterministic CI runs.
 
 ## Product decision (2026-08-23): manual approval for every review
 

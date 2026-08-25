@@ -38,6 +38,7 @@ export const GOOGLE_REPLY_STATES = [
 export type GoogleReplyState = (typeof GOOGLE_REPLY_STATES)[number];
 
 export const AUDIT_EVENTS = [
+  "PUBSUB_NOTIFICATION_RECEIVED",
   "REVIEW_RECEIVED",
   "REVIEW_EDITED",
   "REVIEW_UNCHANGED",

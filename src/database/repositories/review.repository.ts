@@ -147,6 +147,37 @@ export async function findLocationRowId(googleLocationId: string): Promise<strin
   return data?.id ?? null;
 }
 
+export interface SyncedLocation {
+  googleAccountId: string;
+  googleLocationId: string;
+  locationTitle: string | null;
+}
+
+/**
+ * Every location currently synced into this database, with the Google account
+ * id each one belongs to. Used by the Pub/Sub handler's fallback path: when a
+ * notification doesn't identify a specific review clearly enough to fetch it
+ * directly, resyncing every known location is the safe, always-correct
+ * alternative (ingest's own idempotency makes a redundant resync a no-op for
+ * anything that hasn't actually changed) — see reviews/pubsub.service.ts.
+ */
+export async function listSyncedLocations(): Promise<SyncedLocation[]> {
+  const { data, error } = await getDb()
+    .from("locations")
+    .select("google_location_id, title, google_accounts(google_account_id)")
+    .returns<Array<{ google_location_id: string; title: string | null; google_accounts: { google_account_id: string } | null }>>();
+
+  if (error) throw new DatabaseError("Could not list synced locations.", {}, error);
+
+  return (data ?? [])
+    .filter((row) => row.google_accounts !== null)
+    .map((row) => ({
+      googleAccountId: row.google_accounts!.google_account_id,
+      googleLocationId: row.google_location_id,
+      locationTitle: row.title,
+    }));
+}
+
 // ---------------------------------------------------------------------------
 // Reviews
 // ---------------------------------------------------------------------------

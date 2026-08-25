@@ -23,7 +23,7 @@ export const BUSINESS_INFORMATION_BASE = "https://mybusinessbusinessinformation.
 /** Reviews + review replies: still only available on the legacy v4 host. */
 export const LEGACY_MY_BUSINESS_BASE = "https://mybusiness.googleapis.com/v4";
 
-/** Pub/Sub notification settings (wired up in Phase 7). */
+/** Pub/Sub notification settings — PATCH accounts/{id}/notificationSetting. */
 export const NOTIFICATIONS_BASE = "https://mybusinessnotifications.googleapis.com/v1";
 
 /**

@@ -106,6 +106,30 @@ const baseSchema = z.object({
    * false to deliberately reverse that product decision.
    */
   REQUIRE_APPROVAL_FOR_ALL: booleanish.default("true"),
+
+  /**
+   * The `aud` claim Pub/Sub's push OIDC token must carry — set on the push
+   * subscription when it's created (`--push-auth-token-audience`). Defaults to
+   * this endpoint's own URL, which is what Pub/Sub uses when no audience is
+   * explicitly configured on the subscription.
+   */
+  PUBSUB_AUDIENCE: emptyToUndefined(z.string().url().optional()),
+  /**
+   * If set, the push token's `email` claim must equal this exactly (the
+   * service account the push subscription was configured to sign with). If
+   * unset, verification still requires `.iam.gserviceaccount.com` and
+   * `email_verified: true`, just not a specific account — set this once you
+   * know which service account your subscription uses, for a tighter check.
+   */
+  PUBSUB_SERVICE_ACCOUNT_EMAIL: emptyToUndefined(z.string().email().optional()),
+  /**
+   * Skips OIDC verification entirely. For local testing only — there is no
+   * real Pub/Sub push subscription to verify against until Google grants API
+   * access, so this is what makes `scripts/simulate-pubsub-notification.ts`
+   * possible. The route logs a warning on every request while this is true,
+   * specifically so it cannot be silently left on.
+   */
+  PUBSUB_SKIP_VERIFICATION: booleanish.default("false"),
 });
 
 const envSchema = baseSchema.superRefine((value, ctx) => {
@@ -190,4 +214,10 @@ export function getOpenAiApiKey(): string {
     throw new Error("OPENAI_API_KEY is not set. Add it to .env.local to use the AI response service.");
   }
   return key;
+}
+
+/** The expected `aud` claim on a Pub/Sub push OIDC token — PUBSUB_AUDIENCE if set, else this endpoint's own URL. */
+export function getPubSubAudience(): string {
+  const env = getEnv();
+  return env.PUBSUB_AUDIENCE ?? `${env.APP_BASE_URL}/api/pubsub/reviews`;
 }

@@ -4,20 +4,21 @@ Receives Google Business Profile reviews, generates a personalized reply, and
 either publishes it or routes it to a human — with the publish/hold decision
 made by deterministic application code, never by the model.
 
-**Status: Phase 6 complete.** Foundation, Google OAuth, account/location/review
-retrieval, mock fixtures, a reusable AI review-response service with
-structured-output validation, the deterministic risk classification +
-publishing-policy service, the processing pipeline that drives a stored
-review from `RECEIVED` through generation to `GENERATED`/`PENDING_APPROVAL`/
-`FAILED`, the human approval workflow (approve, edit, regenerate, reject,
-unapprove), and publishing an approved or auto-publish-eligible review's
-response to Google (`POST /api/reviews/[id]/publish`) — with an atomic,
-race-proof eligibility check right before every Google write, a live
-existing-reply check that never overwrites a reply this app didn't just
-write, and idempotent recovery if Google accepts a reply but the database
-write recording it fails. See `docs/SPEC.md`'s "Phase 6" section for the
-detailed design. No Pub/Sub-triggered automatic processing yet, and no
-dashboard UI yet (Phases 7 and 8).
+**Status: Phase 8 complete, including Pub/Sub automation.** Foundation,
+Google OAuth, account/location/review retrieval, mock fixtures, a reusable
+AI review-response service with structured-output validation, the
+deterministic risk classification + publishing-policy service, the
+processing pipeline that drives a stored review from `RECEIVED` through
+generation to `GENERATED`/`PENDING_APPROVAL`/`FAILED`, the human approval
+workflow (approve, edit, regenerate, reject, unapprove), publishing to
+Google with an atomic race-proof eligibility check and idempotent crash
+recovery, a background sweep for stuck publishes, the Pub/Sub push endpoint
+that fetches and auto-drafts new/edited reviews on notification, and the
+full dashboard (New Reviews queue, Published history, Settings). See
+`docs/SPEC.md`'s "Current state" section for the detailed design of each
+phase. Still outstanding: connecting a real Google Business Profile account
+(needs Google's API approval, 1-2 weeks) and the Cloud Pub/Sub
+topic/subscription setup this repo can't do for you (see "Pub/Sub" below).
 
 ---
 
@@ -141,13 +142,42 @@ and click **Connect Google**.
 Scope requested: `https://www.googleapis.com/auth/business.manage` (plus
 `openid`/`email`, used only to label which account is connected).
 
-### 4. Pub/Sub — Phase 7, not yet
+### 4. Pub/Sub
 
-For reference: create a topic, then grant
-`mybusiness-api-pubsub@system.gserviceaccount.com` the Publish role on it, then
-PATCH `accounts/{id}/notificationSetting` with the topic and
-`notificationTypes: ["NEW_REVIEW", "UPDATED_REVIEW"]`. One setting and one topic
-per account.
+1. **Create a topic**: Cloud Console → Pub/Sub → Topics → Create. Note its
+   full name (`projects/{project}/topics/{topic}`).
+2. **Grant Business Profile permission to publish to it**: on the topic's
+   permissions, add `mybusiness-api-pubsub@system.gserviceaccount.com` with
+   the Pub/Sub Publisher role.
+3. **Create an authenticated push subscription** on that topic, pointing at
+   `https://your-domain.example/api/pubsub/reviews`. Enable authentication
+   and select (or create) a service account for it — Cloud Console will
+   offer to grant that service account the `roles/iam.serviceAccountTokenCreator`
+   role it needs to sign push tokens. Note the service account's email; put
+   it in `PUBSUB_SERVICE_ACCOUNT_EMAIL` for a tighter verification check (see
+   below). If you set a custom audience on the subscription instead of
+   leaving it default, put that in `PUBSUB_AUDIENCE` too.
+4. **Tell Business Profile to notify that topic**: PATCH
+   `accounts/{id}/notificationSetting` with the topic and
+   `notificationTypes: ["NEW_REVIEW", "UPDATED_REVIEW"]`. One setting and one
+   topic per account.
+
+Once that's done, a new or edited review triggers `POST /api/pubsub/reviews`
+automatically — fetch, ingest, and (unlike the dashboard's manual "Pull
+reviews") an automatic AI draft, landing in the New Reviews queue for a human
+to approve. See docs/SPEC.md's "Pub/Sub automation" section for how the
+endpoint verifies these requests and what it does with them.
+
+**Testing before you have a real subscription**: there's no way to get a
+real Google-signed push request without live infrastructure, so
+`npm run pubsub:simulate` (`scripts/simulate-pubsub-notification.ts`) POSTs a
+fake one — shaped exactly like Pub/Sub's real push format — at your running
+dev server. Set `PUBSUB_SKIP_VERIFICATION=true` in `.env.local` first (dev/
+test only; never set this in a real deployment), start `npm run dev`, then
+run the script. It exercises an ignored notification type, a targeted fetch
+that creates and auto-processes a new review, a duplicate delivery of the
+same notification (proving it doesn't create a second row), and the fallback
+resync path used when a notification's review resource name can't be parsed.
 
 ---
 

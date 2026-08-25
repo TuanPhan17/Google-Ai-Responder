@@ -19,6 +19,10 @@ export function middleware(request: NextRequest) {
   const isPublic =
     pathname === "/login" ||
     pathname === "/api/auth/login" ||
+    // Cloud Pub/Sub push requests never carry this app's session cookie —
+    // they authenticate with their own OIDC token instead, verified inside
+    // the route itself (verifyPubSubPushToken).
+    pathname.startsWith("/api/pubsub/") ||
     pathname.startsWith("/_next") ||
     pathname === "/favicon.ico";
 
